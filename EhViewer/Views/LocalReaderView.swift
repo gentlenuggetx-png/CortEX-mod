@@ -219,120 +219,131 @@ struct LocalReaderView: View {
     /// 動画 WebP migration / override 解決後の有効モード。未解決なら一瞬黒画面。
     private var effectiveDirection: Int { resolvedDirection ?? readerDirection }
 
+    // body の type-check タイムアウト回避 (Xcode 26.3) のため ZStack 各層をヘルパーに分離
+    @ViewBuilder
+    private var readerLayers: some View {
+        Color.black.ignoresSafeArea()
+
+        if resolvedDirection != nil {
+            if effectiveDirection == 0 {
+                verticalReader
+            } else {
+                localHorizontalReader
+            }
+        }
+
+        // Phase R-6: シークサムネプレビュー (常駐・タップ移動・外側タップで閉じる)
+        // controlsOverlay より「下層」に置く → シークバーは最前面のまま操作可能、
+        // 中央の透明領域タップは暗幕に抜けて dismiss、サムネタップはセルが拾う。
+        if seekPreviewVisible {
+            seekPreviewLayer
+        }
+
+        if showControls && zoomImage == nil {
+            controlsOverlay
+        }
+
+        if resolvedDirection != nil && effectiveDirection == 0 && zoomImage == nil {
+            AutoScrollButton(controller: autoScroll, expanded: showControls)
+        }
+
+        // Tips
+        if showControls {
+            VStack(spacing: 8) {
+                TipView(ReaderControlsTip(), arrowEdge: .bottom)
+                if isHorizontal {
+                    TipView(ReaderSwipeDismissTip(), arrowEdge: .bottom)
+                    TipView(HorizontalReaderTip(), arrowEdge: .bottom)
+                }
+                if isHorizontal && readingOrder == 1 {
+                    TipView(RTLSliderTip(), arrowEdge: .bottom)
+                }
+                if UIDevice.current.userInterfaceIdiom == .pad && isHorizontal {
+                    TipView(SpreadModeTip(), arrowEdge: .bottom)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 120)
+            .frame(maxHeight: .infinity, alignment: .bottom)
+        }
+
+        if showPageOverlay {
+            Text("\(Int(sliderValue) + 1)")
+                .font(.system(size: 72, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 140, height: 140)
+                .background(.ultraThinMaterial)
+                .clipShape(Circle())
+                .transition(.opacity)
+        }
+
+        if showFilterPanel && zoomImage == nil && !EcoMode.shared.isEnabled {
+            Color.black.opacity(0.01)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        showFilterPanel = false
+                    }
+                }
+
+            VStack {
+                Spacer()
+                downloadFilterPanel
+            }
+            .padding(.bottom, 100)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+
+        if let img = zoomImage {
+            ZoomableImageOverlay(image: img) {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    zoomImage = nil
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var leadingEdgeOverlay: some View {
+        // 横モード時は左エッジスワイプ無効（ページ送りと干渉防止）
+        if zoomImage == nil && !isHorizontal {
+            Color.clear
+                .frame(width: 24)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            if value.translation.width > 0 {
+                                dragOffset = value.translation.width
+                            }
+                        }
+                        .onEnded { value in
+                            if value.translation.width > 120 {
+                                LogManager.shared.log("Tap", "local dismiss: edge-swipe")
+                                dismiss()
+                            } else {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    dragOffset = 0
+                                }
+                            }
+                        }
+                )
+        }
+        // Phase E1.B 後追加 (2026-04-26): 大幅 jump pre-cache overlay (external_zip / internal DL 共通)
+        if jumpPreCacheActive {
+            jumpPreCacheOverlay
+                .transition(.opacity)
+        }
+    }
+
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-
-            if resolvedDirection != nil {
-                if effectiveDirection == 0 {
-                    verticalReader
-                } else {
-                    localHorizontalReader
-                }
-            }
-
-            // Phase R-6: シークサムネプレビュー (常駐・タップ移動・外側タップで閉じる)
-            // controlsOverlay より「下層」に置く → シークバーは最前面のまま操作可能、
-            // 中央の透明領域タップは暗幕に抜けて dismiss、サムネタップはセルが拾う。
-            if seekPreviewVisible {
-                seekPreviewLayer
-            }
-
-            if showControls && zoomImage == nil {
-                controlsOverlay
-            }
-
-            if resolvedDirection != nil && effectiveDirection == 0 && zoomImage == nil {
-                AutoScrollButton(controller: autoScroll, expanded: showControls)
-            }
-
-            // Tips
-            if showControls {
-                VStack(spacing: 8) {
-                    TipView(ReaderControlsTip(), arrowEdge: .bottom)
-                    if isHorizontal {
-                        TipView(ReaderSwipeDismissTip(), arrowEdge: .bottom)
-                        TipView(HorizontalReaderTip(), arrowEdge: .bottom)
-                    }
-                    if isHorizontal && readingOrder == 1 {
-                        TipView(RTLSliderTip(), arrowEdge: .bottom)
-                    }
-                    if UIDevice.current.userInterfaceIdiom == .pad && isHorizontal {
-                        TipView(SpreadModeTip(), arrowEdge: .bottom)
-                    }
-                }
-                .padding(.horizontal)
-                .padding(.bottom, 120)
-                .frame(maxHeight: .infinity, alignment: .bottom)
-            }
-
-            if showPageOverlay {
-                Text("\(Int(sliderValue) + 1)")
-                    .font(.system(size: 72, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 140, height: 140)
-                    .background(.ultraThinMaterial)
-                    .clipShape(Circle())
-                    .transition(.opacity)
-            }
-
-            if showFilterPanel && zoomImage == nil && !EcoMode.shared.isEnabled {
-                Color.black.opacity(0.01)
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            showFilterPanel = false
-                        }
-                    }
-
-                VStack {
-                    Spacer()
-                    downloadFilterPanel
-                }
-                .padding(.bottom, 100)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            if let img = zoomImage {
-                ZoomableImageOverlay(image: img) {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        zoomImage = nil
-                    }
-                }
-            }
+            readerLayers
         }
         .offset(x: dragOffset)
         .opacity(dragOffset > 0 ? max(0, 1.0 - dragOffset / 400.0) : 1.0)
         .overlay(alignment: .leading) {
-            // 横モード時は左エッジスワイプ無効（ページ送りと干渉防止）
-            if zoomImage == nil && !isHorizontal {
-                Color.clear
-                    .frame(width: 24)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                if value.translation.width > 0 {
-                                    dragOffset = value.translation.width
-                                }
-                            }
-                            .onEnded { value in
-                                if value.translation.width > 120 {
-                                    LogManager.shared.log("Tap", "local dismiss: edge-swipe")
-                                    dismiss()
-                                } else {
-                                    withAnimation(.easeOut(duration: 0.2)) {
-                                        dragOffset = 0
-                                    }
-                                }
-                            }
-                    )
-            }
-            // Phase E1.B 後追加 (2026-04-26): 大幅 jump pre-cache overlay (external_zip / internal DL 共通)
-            if jumpPreCacheActive {
-                jumpPreCacheOverlay
-                    .transition(.opacity)
-            }
+            leadingEdgeOverlay
         }
         #if os(iOS)
         .persistentSystemOverlays(showControls && zoomImage == nil ? .automatic : .hidden)

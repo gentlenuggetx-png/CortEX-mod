@@ -212,94 +212,147 @@ struct DownloadsView: View {
         }
     }
 
+    // body の type-check タイムアウト回避 (Xcode 26.3) のためセクションをヘルパーに分離
+    @ViewBuilder
+    private var activeSection: some View {
+        // ダウンロード中
+        if !activeList.isEmpty {
+            Section("ダウンロード中") {
+                ForEach(activeList, id: \.gid) { item in
+                    downloadingRow(gid: item.gid, progress: item.progress)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if let meta = manager.downloads[item.gid] {
+                                liveReaderMeta = meta
+                            }
+                        }
+                        .contextMenu {
+                            Button {
+                                manager.cancelDownload(gid: item.gid)
+                            } label: {
+                                Label("ダウンロード中止", systemImage: "stop.circle")
+                            }
+                            Button(role: .destructive) {
+                                manager.cancelDownload(gid: item.gid)
+                                manager.deleteDownload(gid: item.gid)
+                            } label: {
+                                Label("削除", systemImage: "trash")
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var completedSection: some View {
+        // ダウンロード済み
+        if !completedList.isEmpty {
+            Section {
+                ForEach(completedList) { meta in
+                    completedRow(meta: meta)
+                        .contextMenu {
+                            Button {
+                                previewMeta = meta
+                            } label: {
+                                Label("プレビュー表示", systemImage: "rectangle.grid.3x2")
+                            }
+                            Button {
+                                detailMeta = meta
+                            } label: {
+                                Label("この作品のページ詳細を見る", systemImage: "doc.text.magnifyingglass")
+                            }
+                            Button {
+                                performExport(meta: meta)
+                            } label: {
+                                Label("エクスポート", systemImage: "square.and.arrow.up")
+                            }
+                            .disabled(exportPhase != nil)
+                            Button(role: .destructive) {
+                                manager.deleteDownload(gid: meta.gid)
+                            } label: {
+                                Label("削除", systemImage: "trash")
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                manager.deleteDownload(gid: meta.gid)
+                            } label: {
+                                Label("削除", systemImage: "trash")
+                            }
+                        }
+                }
+            } header: {
+                // 田中要望 2026-04-27: 「保存済み」section にソート Menu (全プラットフォーム)
+                HStack {
+                    Text("保存済み (\(completedList.count))")
+                    Spacer()
+                    Menu {
+                        Picker("ソート", selection: Binding(
+                            get: { completedSortOrder },
+                            set: { completedSortOrderRaw = $0.rawValue }
+                        )) {
+                            Text("追加日順").tag(ExternalFolderManager.ExternalSortOrder.dateAdded)
+                            Text("名前昇順").tag(ExternalFolderManager.ExternalSortOrder.nameAsc)
+                            Text("名前降順").tag(ExternalFolderManager.ExternalSortOrder.nameDesc)
+                        }
+                    } label: {
+                        Label("ソート", systemImage: "arrow.up.arrow.down.circle")
+                            .labelStyle(.iconOnly)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var incompleteSection: some View {
+        // 未完了
+        if !incompleteList.isEmpty {
+            Section {
+                ForEach(incompleteList) { meta in
+                    incompleteRow(meta: meta)
+                        .contextMenu {
+                            Button {
+                                manager.markAsCompleteIgnoringMissing(gid: meta.gid)
+                            } label: {
+                                Label("強制完了（欠落ページを無視）", systemImage: "checkmark.circle")
+                            }
+                            Button(role: .destructive) {
+                                manager.deleteDownload(gid: meta.gid)
+                            } label: {
+                                Label("削除", systemImage: "trash")
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                manager.deleteDownload(gid: meta.gid)
+                            } label: {
+                                Label("削除", systemImage: "trash")
+                            }
+                        }
+                }
+            } header: {
+                HStack {
+                    Text("未完了")
+                    Spacer()
+                    Button {
+                        manager.resumeAllIncomplete()
+                    } label: {
+                        Label("すべて再開", systemImage: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                }
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
-                // ダウンロード中
-                if !activeList.isEmpty {
-                    Section("ダウンロード中") {
-                        ForEach(activeList, id: \.gid) { item in
-                            downloadingRow(gid: item.gid, progress: item.progress)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    if let meta = manager.downloads[item.gid] {
-                                        liveReaderMeta = meta
-                                    }
-                                }
-                                .contextMenu {
-                                    Button {
-                                        manager.cancelDownload(gid: item.gid)
-                                    } label: {
-                                        Label("ダウンロード中止", systemImage: "stop.circle")
-                                    }
-                                    Button(role: .destructive) {
-                                        manager.cancelDownload(gid: item.gid)
-                                        manager.deleteDownload(gid: item.gid)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
-                                }
-                        }
-                    }
-                }
+                activeSection
 
-                // ダウンロード済み
-                if !completedList.isEmpty {
-                    Section {
-                        ForEach(completedList) { meta in
-                            completedRow(meta: meta)
-                                .contextMenu {
-                                    Button {
-                                        previewMeta = meta
-                                    } label: {
-                                        Label("プレビュー表示", systemImage: "rectangle.grid.3x2")
-                                    }
-                                    Button {
-                                        detailMeta = meta
-                                    } label: {
-                                        Label("この作品のページ詳細を見る", systemImage: "doc.text.magnifyingglass")
-                                    }
-                                    Button {
-                                        performExport(meta: meta)
-                                    } label: {
-                                        Label("エクスポート", systemImage: "square.and.arrow.up")
-                                    }
-                                    .disabled(exportPhase != nil)
-                                    Button(role: .destructive) {
-                                        manager.deleteDownload(gid: meta.gid)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
-                                }
-                                .swipeActions(edge: .trailing) {
-                                    Button(role: .destructive) {
-                                        manager.deleteDownload(gid: meta.gid)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
-                                }
-                        }
-                    } header: {
-                        // 田中要望 2026-04-27: 「保存済み」section にソート Menu (全プラットフォーム)
-                        HStack {
-                            Text("保存済み (\(completedList.count))")
-                            Spacer()
-                            Menu {
-                                Picker("ソート", selection: Binding(
-                                    get: { completedSortOrder },
-                                    set: { completedSortOrderRaw = $0.rawValue }
-                                )) {
-                                    Text("追加日順").tag(ExternalFolderManager.ExternalSortOrder.dateAdded)
-                                    Text("名前昇順").tag(ExternalFolderManager.ExternalSortOrder.nameAsc)
-                                    Text("名前降順").tag(ExternalFolderManager.ExternalSortOrder.nameDesc)
-                                }
-                            } label: {
-                                Label("ソート", systemImage: "arrow.up.arrow.down.circle")
-                                    .labelStyle(.iconOnly)
-                            }
-                        }
-                    }
-                }
+                completedSection
 
                 // Phase E1 (2026-04-26): 外部参照フォルダ配下の作品 (Mac Catalyst のみ)
                 #if targetEnvironment(macCatalyst)
@@ -350,44 +403,7 @@ struct DownloadsView: View {
                 }
                 #endif
 
-                // 未完了
-                if !incompleteList.isEmpty {
-                    Section {
-                        ForEach(incompleteList) { meta in
-                            incompleteRow(meta: meta)
-                                .contextMenu {
-                                    Button {
-                                        manager.markAsCompleteIgnoringMissing(gid: meta.gid)
-                                    } label: {
-                                        Label("強制完了（欠落ページを無視）", systemImage: "checkmark.circle")
-                                    }
-                                    Button(role: .destructive) {
-                                        manager.deleteDownload(gid: meta.gid)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
-                                }
-                                .swipeActions(edge: .trailing) {
-                                    Button(role: .destructive) {
-                                        manager.deleteDownload(gid: meta.gid)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
-                                }
-                        }
-                    } header: {
-                        HStack {
-                            Text("未完了")
-                            Spacer()
-                            Button {
-                                manager.resumeAllIncomplete()
-                            } label: {
-                                Label("すべて再開", systemImage: "arrow.clockwise")
-                                    .font(.caption)
-                            }
-                        }
-                    }
-                }
+                incompleteSection
 
                 // 自動保存 (読んだページの保存のみ = DL 意思なし)。意図的な DL と混ざらない
                 // よう分離 (田中要望 2026-06-10)。「正式にダウンロード登録」で昇格可能。
