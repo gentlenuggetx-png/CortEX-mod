@@ -69,3 +69,23 @@ jobs:
         with:
           name: CortEX-mod-simulator
           path: CortEX-mod-simulator.zip
+
+      - name: Screenshots
+        continue-on-error: true
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone')))")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" build/Build/Products/Release-iphonesimulator/EhViewer.app
+          mkdir -p shots
+          for tab in 0 2 1; do
+            xcrun simctl terminate "$UDID" com.kendr.CortEXMod || true
+            xcrun simctl launch "$UDID" com.kendr.CortEXMod -modStartTab $tab
+            sleep 30
+            xcrun simctl io "$UDID" screenshot "shots/tab$tab.png"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CortEX-mod-screenshots
+          path: shots

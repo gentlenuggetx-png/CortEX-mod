@@ -24,6 +24,8 @@ final class AutoScrollController: ObservableObject {
     }
 
     weak var scrollView: UIScrollView?
+    /// 画面内から探し直すための足場 (Attacher の UIView)
+    weak var anchorView: UIView?
     private var link: CADisplayLink?
     private var lastTimestamp: CFTimeInterval = 0
     /// 開始前の idle timer 状態 (DL 画面など他所で無効化済みの場合に勝手に戻さない)
@@ -42,7 +44,30 @@ final class AutoScrollController: ObservableObject {
     func slowDown() { if canSlowDown { speedLevel -= 1 } }
     func toggle() { isRunning.toggle() }
 
+    /// 実際に縦スクロールできる UIScrollView を確保する。
+    /// 祖先が見つからない / ズーム用の内側 ScrollView だった場合は、ウィンドウ内で一番長いものを使う。
+    private func ensureScrollView() -> UIScrollView? {
+        if let sv = scrollView, sv.window != nil, Self.isScrollable(sv) { return sv }
+        guard let window = anchorView?.window else { return scrollView }
+        var best: UIScrollView?
+        func walk(_ v: UIView) {
+            if let sv = v as? UIScrollView, !sv.isHidden, Self.isScrollable(sv),
+               sv.contentSize.height > (best?.contentSize.height ?? 0) {
+                best = sv
+            }
+            v.subviews.forEach(walk)
+        }
+        walk(window)
+        if let best { scrollView = best }
+        return best ?? scrollView
+    }
+
+    private static func isScrollable(_ sv: UIScrollView) -> Bool {
+        sv.contentSize.height > sv.bounds.height + 1 && sv.contentSize.height > sv.contentSize.width
+    }
+
     private func start() {
+        _ = ensureScrollView()
         lastTimestamp = 0
         let link = CADisplayLink(target: DisplayLinkProxy(self), selector: #selector(DisplayLinkProxy.tick(_:)))
         link.add(to: .main, forMode: .common)
@@ -64,7 +89,7 @@ final class AutoScrollController: ObservableObject {
     fileprivate func tick(_ link: CADisplayLink) {
         let dt = lastTimestamp == 0 ? 0 : link.timestamp - lastTimestamp
         lastTimestamp = link.timestamp
-        guard let sv = scrollView, sv.window != nil else { return }
+        guard let sv = ensureScrollView(), sv.window != nil else { return }
         // 指で触っている / 慣性スクロール中 / ズーム中は送らない (離せば再開)
         if sv.isTracking || sv.isDragging || sv.isDecelerating || sv.isZooming { return }
 
@@ -99,6 +124,7 @@ struct AutoScrollAttacher: UIViewRepresentable {
         let view = FinderView()
         view.isUserInteractionEnabled = false
         view.onFound = { [weak controller] sv in controller?.scrollView = sv }
+        controller.anchorView = view
         return view
     }
 
@@ -136,34 +162,43 @@ struct AutoScrollButton: View {
     let expanded: Bool
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 4) {
             if expanded {
                 Button { controller.slowDown() } label: {
                     Image(systemName: "tortoise.fill")
+                        .font(.title2)
+                        .frame(width: 52, height: 52)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!controller.canSlowDown)
+                .opacity(controller.canSlowDown ? 1 : 0.4)
 
                 Text("\(controller.speedLevel + 1)")
-                    .font(.subheadline.monospacedDigit().bold())
-                    .frame(minWidth: 14)
+                    .font(.title3.monospacedDigit().bold())
+                    .frame(minWidth: 24)
 
                 Button { controller.speedUp() } label: {
                     Image(systemName: "hare.fill")
+                        .font(.title2)
+                        .frame(width: 52, height: 52)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!controller.canSpeedUp)
+                .opacity(controller.canSpeedUp ? 1 : 0.4)
             }
 
             Button { controller.toggle() } label: {
                 Image(systemName: controller.isRunning ? "pause.fill" : "play.fill")
-                    .font(.title3)
-                    .frame(width: 28, height: 28)
+                    .font(.title)
+                    .frame(width: 56, height: 56)
+                    .contentShape(Rectangle())
             }
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .padding(.horizontal, expanded ? 16 : 10)
-        .padding(.vertical, 10)
-        .modGlass(in: Capsule())
+        .padding(.horizontal, expanded ? 10 : 4)
+        .padding(.vertical, 4)
+        .modGlass(in: Capsule(), interactive: false)
         .opacity(expanded || controller.isRunning ? 1 : 0.8)
         .padding(.trailing, 16)
         .padding(.bottom, expanded ? 120 : 28)
@@ -197,9 +232,9 @@ struct ReaderBackButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: "chevron.left")
-                .font(.headline.bold())
+                .font(.title3.bold())
                 .foregroundStyle(.white)
-                .frame(width: 36, height: 36)
+                .frame(width: 48, height: 48)
                 .modGlass(in: Circle())
         }
         .buttonStyle(.plain)
@@ -213,9 +248,10 @@ struct ReaderBackButton: View {
 extension View {
     /// (mod) iOS 26+ は Liquid Glass (ナビの戻るボタンと同じ質感)、旧 OS はすりガラス
     @ViewBuilder
-    func modGlass<S: Shape>(in shape: S) -> some View {
+    func modGlass<S: Shape>(in shape: S, interactive: Bool = true) -> some View {
         if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: shape)
+            // 中にボタンが並ぶ容器は interactive にしない (タップを奪われる)
+            self.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
         } else {
             self.background(.ultraThinMaterial, in: shape)
         }

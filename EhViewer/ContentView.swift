@@ -28,7 +28,8 @@ struct ContentView: View {
     @State private var greenFlash = false
     @State private var greenOpacity: Double = 0
     @State private var importToast: String?
-    @State private var selectedTab = 0
+    // (mod) 起動引数 -modStartTab N で開くタブを指定 (CI スクリーンショット用)
+    @State private var selectedTab = UserDefaults.standard.integer(forKey: "modStartTab")
     private var colorScheme: ColorScheme? {
         switch appTheme {
         case 1: return .dark

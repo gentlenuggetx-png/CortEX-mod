@@ -71,6 +71,9 @@ struct NhentaiScrollList: View {
                     if index < viewModel.galleries.count {
                         let nh = viewModel.galleries[index]
                         NhentaiGridCellView(gallery: nh)
+                            .overlay(alignment: .topTrailing) {
+                                NhFavoriteHeartButton(gallery: nh, compact: true).padding(4)
+                            }
                             .matchedTransitionSource(id: "nh-\(nh.id)", in: zoomNamespace)   // B3 online
                             .contentShape(Rectangle())
                             .onTapGesture {
@@ -538,6 +541,8 @@ struct NhentaiCoverView: View {
 /// (mod) フィード用のお気に入りハート。タップで追加/解除 (未ログインならアプリ内のみ)
 struct NhFavoriteHeartButton: View {
     let gallery: NhentaiClient.NhGallery
+    /// グリッドの小さいセル用
+    var compact = false
     @ObservedObject private var nhFavCache = NhentaiFavoritesCache.shared
 
     var body: some View {
@@ -548,10 +553,12 @@ struct NhFavoriteHeartButton: View {
             toggle(isFavorited: isFavorited)
         } label: {
             Image(systemName: isFavorited ? "heart.fill" : "heart")
-                .font(.title3)
-                .foregroundStyle(isFavorited ? .red : .secondary)
-                .padding(10)
+                .font(compact ? .subheadline.bold() : .title3)
+                .foregroundStyle(isFavorited ? .red : .white)
+                .shadow(color: .black.opacity(0.5), radius: 2)
+                .frame(width: compact ? 32 : 44, height: compact ? 32 : 44)
                 .modGlass(in: Circle())
+                .contentShape(Circle())
         }
         .buttonStyle(.borderless)
     }
