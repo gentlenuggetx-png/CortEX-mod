@@ -123,6 +123,10 @@ struct NhentaiReaderView: View {
                 AutoScrollButton(controller: autoScroll, expanded: showControls)
             }
 
+            if !showControls && zoomImage == nil {
+                ReaderBackButton { handleClose() }
+            }
+
             // ズームオーバーレイ
             if let img = zoomImage {
                 ZoomableImageOverlay(image: img) {

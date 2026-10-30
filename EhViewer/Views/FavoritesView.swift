@@ -368,9 +368,9 @@ struct FavoritesView: View {
                         }
                     } else {
                         ContentUnavailableView {
-                            Label("nhentai未ログイン", systemImage: "person.crop.circle.badge.exclamationmark")
+                            Label("No favorites yet", systemImage: "heart")
                         } description: {
-                            Text("設定からnhentaiにログインしてください")
+                            Text("Tap the ♥ on a book page or in the reader to save it here.")
                         }
                     }
                     Spacer()
@@ -400,6 +400,27 @@ struct FavoritesView: View {
                                 #endif
                                 previewNhGallery = nh
                             }
+                            // (mod) ワンタップでお気に入り解除
+                            .overlay(alignment: .bottomTrailing) {
+                                Button {
+                                    removeNhFavorite(nh)
+                                } label: {
+                                    Image(systemName: "heart.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(.red)
+                                        .padding(10)
+                                        .background(.ultraThinMaterial, in: Circle())
+                                }
+                                .buttonStyle(.borderless)
+                                .padding(8)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    removeNhFavorite(nh)
+                                } label: {
+                                    Label("Remove", systemImage: "heart.slash")
+                                }
+                            }
                     }
                 }
                 #if os(iOS)
@@ -428,10 +449,24 @@ struct FavoritesView: View {
 
     /// キャッシュからnhentaiお気に入りを読み込み
     private func loadNhFromCache() {
-        let cached = nhFavCache.load()
-        if !cached.isEmpty {
-            nhFavorites = cached
+        // 空でも反映する (最後の1件を解除したときに一覧から消えるように)
+        nhFavorites = nhFavCache.load()
+    }
+
+    /// (mod) 一覧からお気に入り解除。ログイン時はサーバー側も外せるよう Safari を開く
+    private func removeNhFavorite(_ nh: NhentaiClient.NhGallery) {
+        #if canImport(UIKit)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
+        withAnimation {
+            nhFavorites.removeAll { $0.id == nh.id }
         }
+        nhFavCache.removeFromCache(id: nh.id)
+        #if canImport(UIKit)
+        if NhentaiCookieManager.isLoggedIn(), let url = URL(string: "https://nhentai.net/g/\(nh.id)/") {
+            UIApplication.shared.open(url)
+        }
+        #endif
     }
 
     /// nhentaiお気に入りをサーバーと同期（WKWebView HTML解析）

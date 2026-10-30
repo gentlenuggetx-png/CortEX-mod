@@ -190,3 +190,23 @@ struct AutoScrollButton: View {
     var body: some View { EmptyView() }
 }
 #endif
+
+/// バー非表示中も左上に残る小さな戻るボタン (mod)
+struct ReaderBackButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "chevron.left")
+                .font(.headline.bold())
+                .foregroundStyle(.white)
+                .frame(width: 36, height: 36)
+                .background(.black.opacity(0.45), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, 12)
+        .padding(.top, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .transition(.opacity)
+    }
+}

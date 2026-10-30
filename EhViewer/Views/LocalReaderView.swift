@@ -247,6 +247,13 @@ struct LocalReaderView: View {
             AutoScrollButton(controller: autoScroll, expanded: showControls)
         }
 
+        if !showControls && zoomImage == nil {
+            ReaderBackButton {
+                LogManager.shared.log("Tap", "local dismiss: back-button")
+                dismiss()
+            }
+        }
+
         // Tips
         if showControls {
             VStack(spacing: 8) {

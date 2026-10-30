@@ -120,6 +120,10 @@ struct GalleryReaderView: View {
                 AutoScrollButton(controller: autoScroll, expanded: showControls)
             }
 
+            if !showControls && zoomImage == nil {
+                ReaderBackButton { handleDismiss() }
+            }
+
             // スライダー操作中のページ番号オーバーレイ
             // サムネプレビュー版は撤回 (田中指示 2026-06-10): オンラインビューワーは
             // スプライト未取得でプレビューが出ない。プレビューはライブラリ側だけの話。
