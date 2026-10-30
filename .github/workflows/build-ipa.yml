@@ -56,7 +56,7 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build \
             -skipPackagePluginValidation -skipMacroValidation \
-            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
 
