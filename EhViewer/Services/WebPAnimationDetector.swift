@@ -1,0 +1,61 @@
+import Foundation
+import ImageIO
+
+/// WebP RIFF コンテナ先頭 21 バイトを読み VP8X chunk の ANIM flag (bit1, 0x02) を判定。
+/// ImageIO 全フレームデコードより軽量。静止 WebP (VP8 / VP8L) は即 false。
+///
+/// VP8X header 無しでも複数 frame を含む WebP variant (E-Hentai 配信で観測) があるため、
+/// header 判定で false の場合のみ ImageIO の `CGImageSourceGetCount > 1` で再判定する。
+/// ローカルビューワー (AnimatedImageDecoder.isAnimatedFile) と判定結果を揃えるための
+/// fallback (田中報告 2026-04-25「DLすれば動画になるのに通常リーダーで static 扱い」)。
+// nonisolated: 純関数 (ファイルヘッダ読みのみ、共有状態なし)。デフォルト MainActor 下で
+// 背景キューから呼んでも main へホップさせないため明示 (2026-06-10 スクロールヒッチ対策)。
+nonisolated enum WebPAnimationDetector {
+    static func isAnimatedWebP(url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 32), data.count >= 21 else { return false }
+        if checkHeader(Array(data)) { return true }
+        // VP8X 無し variant: ImageIO で frame 数判定 (mmap、メモリ負荷軽い)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return false }
+        return CGImageSourceGetCount(src) > 1
+    }
+
+    static func isAnimatedWebP(data: Data) -> Bool {
+        guard data.count >= 21 else { return false }
+        if checkHeader(Array(data.prefix(32))) { return true }
+        // CGImageSourceCreateWithData だと E-Hentai の WebP variant で frame 数を認識しない
+        // (DL 経路は disk file を CGImageSourceCreateWithURL で見るので animated 認識される)。
+        // tmp file 経由 URL ベース判定で挙動を揃える (田中報告 2026-04-25「DL すれば動画」根因)。
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("anim_check_\(UUID().uuidString).webp")
+        guard (try? data.write(to: tmpURL)) != nil else { return false }
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        guard let src = CGImageSourceCreateWithURL(tmpURL as CFURL, nil) else { return false }
+        return CGImageSourceGetCount(src) > 1
+    }
+
+    private static func checkHeader(_ b: [UInt8]) -> Bool {
+        // "RIFF" ... "WEBP"
+        guard b.count >= 21 else { return false }
+        guard b[0] == 0x52, b[1] == 0x49, b[2] == 0x46, b[3] == 0x46 else { return false }
+        guard b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 else { return false }
+        // chunk FourCC at 12..<16
+        guard b[12] == 0x56, b[13] == 0x50, b[14] == 0x38, b[15] == 0x58 else {
+            // VP8 (static) or VP8L (static lossless) → not animated
+            return false
+        }
+        // VP8X flags at byte 20: ANIM = bit 1 (0x02)
+        return (b[20] & 0x02) != 0
+    }
+
+    /// ディレクトリ内に 1 枚でもアニメ WebP があれば true (JPEG/PNG/GIF 等は skip)。
+    static func directoryContainsAnimated(_ dir: URL, fileManager: FileManager = .default) -> Bool {
+        guard let it = fileManager.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+            return false
+        }
+        for case let url as URL in it {
+            if isAnimatedWebP(url: url) { return true }
+        }
+        return false
+    }
+}

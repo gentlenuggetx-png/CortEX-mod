@@ -1,0 +1,845 @@
+import Foundation
+
+/// nhentai API クライアント
+/// nonisolated (2026-06-10 BlockSample 実測): 素の enum は暗黙 @MainActor で、検索/ギャラリー
+/// 取得の JSON デコード (NhPage 数千件級) が main で走りフレーム凍結源だった。EhClient の
+/// nonisolated 化 (f1df811) から漏れていた箇所。static 可変状態は cdnCache のみで NSLock 保護済み。
+nonisolated enum NhentaiClient {
+
+    // MARK: - Models
+
+    nonisolated struct NhGallery: Codable, Identifiable, Hashable, Sendable {
+        static func == (lhs: NhGallery, rhs: NhGallery) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
+        let id: Int
+        let media_id: String
+        let title: NhTitle
+        let images: NhImages?
+        let num_pages: Int
+        let tags: [NhTag]?
+        let thumbnailPath: String?  // v2 search: サムネパス
+
+        var displayTitle: String { title.japanese ?? title.english ?? title.pretty ?? "\(id)" }
+        var englishTitle: String { title.english ?? title.pretty ?? "\(id)" }
+
+        // v1 + v2 両対応デコーダー
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: DecodingKeys.self)
+
+            // ID: Int or String
+            if let intId = try? c.decode(Int.self, forKey: .id) {
+                id = intId
+            } else {
+                let strId = try c.decode(String.self, forKey: .id)
+                id = Int(strId) ?? 0
+            }
+
+            media_id = try c.decode(String.self, forKey: .media_id)
+
+            // title: v1は NhTitle オブジェクト、v2は english_title / japanese_title フラットフィールド
+            if let titleObj = try? c.decode(NhTitle.self, forKey: .title) {
+                title = titleObj
+            } else {
+                let en = try c.decodeIfPresent(String.self, forKey: .english_title)
+                let jp = try c.decodeIfPresent(String.self, forKey: .japanese_title)
+                title = NhTitle(english: en, japanese: jp, pretty: en)
+            }
+
+            // images: v1は NhImages オブジェクト、v2はトップレベルに pages/cover/thumbnail
+            if let imagesObj = try? c.decode(NhImages.self, forKey: .images) {
+                images = imagesObj
+            } else {
+                let pages = (try? c.decodeIfPresent([NhPage].self, forKey: .pages)) ?? []
+                let cover = try? c.decodeIfPresent(NhPage.self, forKey: .cover)
+                let thumb = try? c.decodeIfPresent(NhPage.self, forKey: .thumbnail)
+                if !pages.isEmpty || cover != nil {
+                    images = NhImages(pages: pages, cover: cover, thumbnail: thumb)
+                } else {
+                    images = nil
+                }
+            }
+
+            // num_pages
+            num_pages = (try? c.decode(Int.self, forKey: .num_pages)) ?? 0
+
+            // tags: v1は [NhTag]、v2検索結果は tag_ids: [Int]
+            if let tagObjs = try? c.decodeIfPresent([NhTag].self, forKey: .tags) {
+                tags = tagObjs
+            } else {
+                tags = nil
+            }
+
+            // v2 search: thumbnail (文字列パス)
+            if let thumbStr = try? c.decodeIfPresent(String.self, forKey: .thumbnail) {
+                thumbnailPath = thumbStr
+            } else {
+                thumbnailPath = nil
+            }
+        }
+
+        private enum DecodingKeys: String, CodingKey {
+            case id, media_id, title, images, num_pages, tags
+            case english_title, japanese_title, tag_ids
+            case pages, cover, thumbnail
+        }
+
+        private enum EncodingKeys: String, CodingKey {
+            case id, media_id, title, images, num_pages, tags, thumbnailPath
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: EncodingKeys.self)
+            try c.encode(id, forKey: .id)
+            try c.encode(media_id, forKey: .media_id)
+            try c.encode(title, forKey: .title)
+            try c.encodeIfPresent(images, forKey: .images)
+            try c.encode(num_pages, forKey: .num_pages)
+            try c.encodeIfPresent(tags, forKey: .tags)
+            try c.encodeIfPresent(thumbnailPath, forKey: .thumbnailPath)
+        }
+
+        // 手動init
+        init(id: Int, media_id: String, title: NhTitle, images: NhImages?, num_pages: Int, tags: [NhTag]?, thumbnailPath: String? = nil) {
+            self.id = id; self.media_id = media_id; self.title = title
+            self.images = images; self.num_pages = num_pages; self.tags = tags
+            self.thumbnailPath = thumbnailPath
+        }
+    }
+
+    struct NhTitle: Codable, Sendable {
+        let english: String?
+        let japanese: String?
+        let pretty: String?
+    }
+
+    struct NhImages: Codable, Sendable {
+        let pages: [NhPage]
+        let cover: NhPage?
+        let thumbnail: NhPage?
+    }
+
+    struct NhPage: Codable, Sendable {
+        let t: String  // j=jpg, p=png, g=gif, w=webp
+        let w: Int
+        let h: Int
+        let path: String?      // v2: "galleries/XXXX/1.webp"
+        let thumbPath: String?  // v2: "galleries/XXXX/1t.webp"
+
+        var ext: String {
+            // v2: pathから拡張子を取得
+            if let path, let lastDot = path.lastIndex(of: ".") {
+                return String(path[path.index(after: lastDot)...])
+            }
+            switch t {
+            case "j": return "jpg"
+            case "p": return "png"
+            case "g": return "gif"
+            case "w": return "webp"
+            default: return "jpg"
+            }
+        }
+
+        // v1 + v2 両対応デコーダー
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // v2: path, width, height, thumbnail
+            path = try c.decodeIfPresent(String.self, forKey: .path)
+            thumbPath = try c.decodeIfPresent(String.self, forKey: .thumbnail)
+            if let width = try? c.decode(Int.self, forKey: .width) {
+                w = width
+                h = (try? c.decode(Int.self, forKey: .height)) ?? 0
+                // pathから拡張子コードを推定
+                if let p = path, p.hasSuffix(".webp") { t = "w" }
+                else if let p = path, p.hasSuffix(".png") { t = "p" }
+                else if let p = path, p.hasSuffix(".gif") { t = "g" }
+                else { t = "j" }
+            } else {
+                // v1: t, w, h（thumbPathはv2のみ）
+                t = (try? c.decode(String.self, forKey: .t)) ?? "j"
+                w = (try? c.decode(Int.self, forKey: .w)) ?? 0
+                h = (try? c.decode(Int.self, forKey: .h)) ?? 0
+                if thumbPath == nil {
+                    // v1にはthumbnailフィールドがないのでnilのまま
+                }
+            }
+        }
+
+        init(t: String, w: Int, h: Int, path: String? = nil, thumbPath: String? = nil) {
+            self.t = t; self.w = w; self.h = h; self.path = path; self.thumbPath = thumbPath
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case t, w, h, path, width, height, thumbnail, thumbPath
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(t, forKey: .t)
+            try c.encode(w, forKey: .w)
+            try c.encode(h, forKey: .h)
+            try c.encodeIfPresent(path, forKey: .path)
+            try c.encodeIfPresent(thumbPath, forKey: .thumbPath)
+        }
+    }
+
+    struct NhTag: Codable, Sendable {
+        let id: Int
+        let type: String
+        let name: String
+        let url: String?
+        let count: Int?
+        let slug: String?
+    }
+
+    struct NhSearchResult: Codable, Sendable {
+        let result: [NhGallery]
+        let num_pages: Int
+        let per_page: Int
+        let total: Int?
+
+        init(result: [NhGallery], num_pages: Int, per_page: Int, total: Int? = nil) {
+            self.result = result; self.num_pages = num_pages; self.per_page = per_page; self.total = total
+        }
+    }
+
+    // MARK: - API
+
+    /// CDN画像用セッション（並列1制限 = レート制限対策）
+    private static let cdnSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.httpMaximumConnectionsPerHost = 6  // ブラウザ同等（nhentaiはレート制限なし）
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return URLSession(configuration: config)
+    }()
+
+    /// API/HTML用セッション（CDN画像DLにブロックされない）
+    private static let apiSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return URLSession(configuration: config)
+    }()
+
+    /// WKWebViewと同一UA（Cloudflareフィンガープリント一致のため）
+    // UA はログイン WebView (NhentaiLoginView) / nhBridge と同期必須 (cf_clearance が UA に bind されるため)
+    #if targetEnvironment(macCatalyst)
+    private static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    #else
+    private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+    #endif
+
+    /// Cloudflare対策: Cookie + Referer + UA 付きリクエストを生成
+    private static func buildRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        if let cookie = NhentaiCookieManager.cookieHeader() {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        request.setValue("https://nhentai.net/", forHTTPHeaderField: "Referer")
+        return request
+    }
+
+    /// ギャラリー情報取得（v2 API）
+    static func fetchGallery(id: Int) async throws -> NhGallery {
+        let urlStr = "https://nhentai.net/api/v2/galleries/\(id)"
+        let data = try await NhentaiWebBridge.shared.fetch(url: urlStr)
+        let gallery = try JSONDecoder().decode(NhGallery.self, from: data)
+        // id パース失敗 (フォールバック 0) は CDN 解決不能 + DL ディレクトリ衝突源なので弾く
+        guard gallery.id > 0 else { throw URLError(.cannotParseResponse) }
+        return gallery
+    }
+
+    /// タイトル検索（v2 API）
+    /// sort: nil=date, "popular", "popular-today", "popular-week", "popular-month"
+    static func search(query: String, page: Int = 1, sort: String? = nil) async throws -> NhSearchResult {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var urlString: String
+        var clientFilter: String? = nil
+
+        if trimmed.isEmpty && (sort == nil || sort?.isEmpty == true) {
+            // 空クエリ＆ソートなし → 全件API（新着順）
+            urlString = "https://nhentai.net/api/v2/galleries?page=\(page)"
+        } else if !trimmed.isEmpty {
+            var searchQuery = trimmed
+            if !searchQuery.contains(":") && !searchQuery.hasPrefix("\"") {
+                searchQuery = "\"\(searchQuery)\""
+                clientFilter = trimmed.lowercased()
+            }
+            let encoded = searchQuery.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? searchQuery
+            urlString = "https://nhentai.net/api/v2/search?query=\(encoded)&page=\(page)"
+        } else {
+            // 空クエリ + sort あり (人気順など)。
+            // /api/v2/galleries は date-listing 専用で sort=popular を無視。
+            // v1 時代の動作に倣い、search に **クォート付き空文字列 `""`** を投げる。
+            // `query=` (素の空) だと sort も無視されるが `query=""` だと sort が効く (2026-04-27 fix)。
+            let emptyQuoted = "\"\"".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "%22%22"
+            urlString = "https://nhentai.net/api/v2/search?query=\(emptyQuoted)&page=\(page)"
+        }
+
+        if let sort, !sort.isEmpty {
+            let sortValue = sort == "popular" ? "popular" : sort
+            urlString += "&sort=\(sortValue)"
+        }
+
+        LogManager.shared.log("nhentai", "API: \(urlString)")
+        let data = try await NhentaiWebBridge.shared.fetch(url: urlString)
+        LogManager.shared.log("nhentai", "response: size=\(data.count)")
+        var result: NhSearchResult
+        do {
+            result = try JSONDecoder().decode(NhSearchResult.self, from: data)
+        } catch let decodingError as DecodingError {
+            switch decodingError {
+            case .typeMismatch(let type, let ctx):
+                LogManager.shared.log("nhentai", "decode typeMismatch: \(type) at \(ctx.codingPath.map(\.stringValue)) - \(ctx.debugDescription)")
+            case .valueNotFound(let type, let ctx):
+                LogManager.shared.log("nhentai", "decode valueNotFound: \(type) at \(ctx.codingPath.map(\.stringValue))")
+            case .keyNotFound(let key, let ctx):
+                LogManager.shared.log("nhentai", "decode keyNotFound: \(key.stringValue) at \(ctx.codingPath.map(\.stringValue))")
+            case .dataCorrupted(let ctx):
+                LogManager.shared.log("nhentai", "decode dataCorrupted: \(ctx.codingPath.map(\.stringValue)) - \(ctx.debugDescription)")
+            @unknown default:
+                LogManager.shared.log("nhentai", "decode unknown: \(decodingError)")
+            }
+            throw decodingError
+        }
+
+        // id パース失敗 (フォールバック 0) の作品を除外
+        // (id<=0 は CDN 解決不能 + DL ディレクトリ衝突するため一覧に流さない)
+        let validGalleries = result.result.filter { $0.id > 0 }
+        if validGalleries.count != result.result.count {
+            LogManager.shared.log("nhentai", "filtered \(result.result.count - validGalleries.count) galleries with invalid id (<=0)")
+            result = NhSearchResult(result: validGalleries, num_pages: result.num_pages, per_page: result.per_page, total: result.total)
+        }
+
+        // クライアント側フィルタ: タイトルに検索語が含まれない結果を除外
+        if let filter = clientFilter {
+            let filtered = result.result.filter { gallery in
+                let titles = [
+                    gallery.title.english?.lowercased(),
+                    gallery.title.japanese?.lowercased(),
+                    gallery.title.pretty?.lowercased()
+                ].compactMap { $0 }
+                return titles.contains { $0.contains(filter) }
+            }
+            result = NhSearchResult(result: filtered, num_pages: result.num_pages, per_page: result.per_page)
+        }
+
+        return result
+    }
+
+    // MARK: - CDN動的解決（HTMLスクレイピング）
+
+    /// CDNホスト名キャッシュ: galleryId -> (imageCDN, thumbCDN)
+    /// 例: 638831 -> ("i7", "t7")
+    /// 並行 read/write によるメモリ破壊防止のため必ず cdnCacheLock 経由のヘルパーで触る
+    nonisolated(unsafe) private static var cdnCache: [Int: (image: String, thumb: String)] = [:]
+    nonisolated(unsafe) private static let cdnCacheLock = NSLock()
+
+    nonisolated private static func cachedCDN(galleryId: Int) -> (image: String, thumb: String)? {
+        cdnCacheLock.lock(); defer { cdnCacheLock.unlock() }
+        return cdnCache[galleryId]
+    }
+
+    nonisolated private static func setCachedCDN(_ value: (image: String, thumb: String), galleryId: Int) {
+        cdnCacheLock.lock(); defer { cdnCacheLock.unlock() }
+        cdnCache[galleryId] = value
+    }
+
+    /// ギャラリーページをスクレイピングして実際のCDN URLを取得
+    /// ※nhentaiはSPAのためHTMLに画像URLが含まれず、現在はほぼ機能しない
+    /// WebP修正により直接CDNアクセスが動作するため、フォールバック用途のみ
+    private static func discoverCDN(galleryId: Int) async -> (image: String, thumb: String)? {
+        // galleryId=0（旧互換API）の場合はスキップ
+        guard galleryId > 0 else { return nil }
+        // キャッシュ確認
+        if let cached = cachedCDN(galleryId: galleryId) { return cached }
+
+        let pageURL = URL(string: "https://nhentai.net/g/\(galleryId)/1/")!
+        let request = buildRequest(url: pageURL)
+
+        guard let (data, response) = try? await apiSession.data(for: request) else { return nil }
+
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200, let html = String(data: data, encoding: .utf8) else { return nil }
+
+        // 画像URLを抽出（SPA上では通常見つからない）
+        let imgPattern = #"https?://([a-z0-9]+)\.nhentai\.net/galleries/\d+/\d+\.\w+"#
+        if let regex = try? NSRegularExpression(pattern: imgPattern),
+           let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let range = Range(match.range(at: 1), in: html) {
+            let img = String(html[range])
+            let result = (image: img, thumb: img.replacingOccurrences(of: "i", with: "t"))
+            setCachedCDN(result, galleryId: galleryId)
+            LogManager.shared.log("nhentai", "CDN discovered: gallery=\(galleryId) image=\(result.image)")
+            return result
+        }
+
+        return nil
+    }
+
+    // MARK: - 画像URL
+
+    private static let fallbackImageCDNs = ["i", "i1", "i2", "i3"]
+    private static let fallbackThumbCDNs = ["t", "t1", "t2", "t3"]
+
+    /// APIレスポンス由来の path/media_id を含む CDN URL を安全に生成。
+    /// 異常文字混入時は percent-encoding を挟んで再試行 (force unwrap クラッシュ対策)。
+    /// '/' は urlPathAllowed に含まれるためパス区切りは保持される
+    nonisolated private static func safeCDNURL(host: String, path: String) -> URL? {
+        if let url = URL(string: "https://\(host).nhentai.net/\(path)") { return url }
+        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        return URL(string: "https://\(host).nhentai.net/\(encoded)")
+    }
+
+    /// ページ画像URL（v2 path対応）
+    static func imageURL(mediaId: String, page: Int, ext: String, path: String? = nil) -> URL {
+        if let path, let url = safeCDNURL(host: "i", path: path) {
+            return url
+        }
+        // path 不正時も安全なフォールバック (クラッシュさせない)
+        return safeCDNURL(host: "i", path: "galleries/\(mediaId)/\(page).\(ext)")
+            ?? URL(string: "https://i.nhentai.net/")!
+    }
+
+    /// サムネURL（v2 thumbnail path対応）
+    static func thumbURL(mediaId: String, page: Int, ext: String, path: String? = nil) -> URL {
+        if let path, let url = safeCDNURL(host: "t", path: path) {
+            return url
+        }
+        return safeCDNURL(host: "t", path: "galleries/\(mediaId)/\(page)t.\(ext)")
+            ?? URL(string: "https://t.nhentai.net/")!
+    }
+
+    /// カバーURL（v2 path対応）
+    static func coverURL(mediaId: String, ext: String, path: String? = nil) -> URL {
+        if let path, let url = safeCDNURL(host: "t", path: path) {
+            return url
+        }
+        return safeCDNURL(host: "t", path: "galleries/\(mediaId)/cover.\(ext)")
+            ?? URL(string: "https://t.nhentai.net/")!
+    }
+
+    // MARK: - 画像データ取得
+
+    /// HTMLレスポンス検出
+    /// サイズによらず先頭バイトで判定 (10KB 超のエラーページ素通し対策)。
+    /// 画像マジックバイト (PNG/JPEG/GIF/WebP) が確認できれば画像として通す
+    private static func isHTMLResponse(_ data: Data) -> Bool {
+        guard let first = data.first else { return false }
+        if data.count >= 12 {
+            let head = [UInt8](data.prefix(12))
+            if head[0] == 0x89, head[1] == 0x50, head[2] == 0x4E, head[3] == 0x47 { return false } // PNG
+            if head[0] == 0xFF, head[1] == 0xD8, head[2] == 0xFF { return false }                  // JPEG
+            if head[0] == 0x47, head[1] == 0x49, head[2] == 0x46 { return false }                  // GIF
+            if head[0] == 0x52, head[1] == 0x49, head[2] == 0x46, head[3] == 0x46,
+               head[8] == 0x57, head[9] == 0x45, head[10] == 0x42, head[11] == 0x50 { return false } // RIFF....WEBP
+        }
+        return first == 0x3C // '<'
+    }
+
+    /// 単一URLで画像データ取得（CDNセッション使用）
+    private static func fetchRawImage(url: URL, onProgress: (@Sendable (Double) -> Void)? = nil) async -> (data: Data, status: Int)? {
+        let request = buildRequest(url: url)
+        let result: (Data, URLResponse)?
+        if let onProgress {
+            result = try? await dataWithProgress(session: cdnSession, request: request, onProgress: onProgress)
+        } else {
+            result = try? await cdnSession.data(for: request)
+        }
+        guard let (data, response) = result else { return nil }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        return (data, status)
+    }
+
+    /// URLSessionTask.progress (Content-Length 既知時) を KVO 観測して DL 進捗を報告
+    /// (田中要望 2026-06-09: nh リーダーにも E-H と同じ進捗バーを移植)。
+    private static func dataWithProgress(session: URLSession, request: URLRequest, onProgress: @escaping @Sendable (Double) -> Void) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
+            var obs: NSKeyValueObservation?
+            let task = session.dataTask(with: request) { data, response, error in
+                obs?.invalidate(); obs = nil
+                if let error {
+                    cont.resume(throwing: error)
+                } else if let data, let response {
+                    cont.resume(returning: (data, response))
+                } else {
+                    cont.resume(throwing: URLError(.badServerResponse))
+                }
+            }
+            // 2026-06-10: チャンク毎の main ホップ + 再描画がスクロールを荒らすため 2% 刻みに間引く
+            // (E-H 側と同じ ProgressReportThrottle を共用)
+            let throttle = ProgressReportThrottle()
+            obs = task.progress.observe(\.fractionCompleted) { prog, _ in
+                let f = prog.fractionCompleted
+                if throttle.shouldReport(f) { onProgress(f) }
+            }
+            task.resume()
+        }
+    }
+
+    /// サムネ/カバー用の軽量取得（apiSession使用、並列制限なし）
+    /// サムネ/カバー用
+    private static func fetchLightImage(url: URL) async -> (data: Data, status: Int)? {
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://nhentai.net/", forHTTPHeaderField: "Referer")
+        if let cookie = NhentaiCookieManager.cookieHeader() {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status != 200 && url.pathExtension == "webp" {
+                LogManager.shared.log("nhentai", "lightImage: \(url.lastPathComponent) status=\(status)")
+            }
+            return (data, status)
+        } catch {
+            LogManager.shared.log("nhentai", "lightImage throw: \(error.localizedDescription) code=\((error as NSError).code) url=\(url.lastPathComponent)")
+            return nil
+        }
+    }
+
+    /// 画像データ取得（単一URL、CDNフォールバック付き）
+    static func fetchImageData(url: URL) async throws -> Data {
+        // まず直接試行
+        if let result = await fetchRawImage(url: url),
+           result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+            return result.data
+        }
+
+        // フォールバック: CDN切替
+        let cdns = url.host?.starts(with: "t") == true ? fallbackThumbCDNs : fallbackImageCDNs
+        for cdn in cdns {
+            let altStr = url.absoluteString
+                .replacingOccurrences(of: #"://[a-z]\d*\."#, with: "://\(cdn).", options: .regularExpression)
+            guard let altURL = URL(string: altStr), altURL != url else { continue }
+            if let result = await fetchRawImage(url: altURL),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+
+        throw URLError(.badServerResponse)
+    }
+
+    /// ページ画像取得（CDN動的解決 + フォールバック）
+    /// ページ画像URLの候補を全て返す（background URLSession用）
+    /// 発見済みCDN → fallbackCDN の順で並べる
+    nonisolated static func candidateImageURLs(galleryId: Int, mediaId: String, page: Int, ext: String, path: String? = nil) async -> [URL] {
+        var urls: [URL] = []
+        if let path {
+            for cdn in fallbackImageCDNs {
+                if let url = URL(string: "https://\(cdn).nhentai.net/\(path)") {
+                    urls.append(url)
+                }
+            }
+        }
+        if let cdn = await discoverCDN(galleryId: galleryId),
+           let url = URL(string: "https://\(cdn.image).nhentai.net/galleries/\(mediaId)/\(page).\(ext)") {
+            urls.append(url)
+        }
+        for cdn in fallbackImageCDNs {
+            if let url = URL(string: "https://\(cdn).nhentai.net/galleries/\(mediaId)/\(page).\(ext)") {
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
+    static func fetchPageImage(galleryId: Int, mediaId: String, page: Int, ext: String, path: String? = nil, onProgress: (@Sendable (Double) -> Void)? = nil) async throws -> Data {
+        // 0. v2 path直接アクセス
+        if let path {
+            for cdn in fallbackImageCDNs {
+                guard let url = safeCDNURL(host: cdn, path: path) else { continue }
+                if let result = await fetchRawImage(url: url, onProgress: onProgress),
+                   result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                    return result.data
+                }
+            }
+        }
+
+        // 1. CDN動的解決（ギャラリーページHTMLから実際のCDN URLを取得）
+        if let cdn = await discoverCDN(galleryId: galleryId),
+           let url = safeCDNURL(host: cdn.image, path: "galleries/\(mediaId)/\(page).\(ext)") {
+            if let result = await fetchRawImage(url: url, onProgress: onProgress),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+            LogManager.shared.log("nhentai", "discovered CDN \(cdn.image) failed: page \(page)")
+        }
+
+        // 2. フォールバック: 全CDNを試行
+        for (i, cdn) in fallbackImageCDNs.enumerated() {
+            guard let url = safeCDNURL(host: cdn, path: "galleries/\(mediaId)/\(page).\(ext)") else { continue }
+            if let result = await fetchRawImage(url: url, onProgress: onProgress) {
+                if result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                    // 成功したCDNをキャッシュ
+                    setCachedCDN((image: cdn, thumb: cdn.replacingOccurrences(of: "i", with: "t")), galleryId: galleryId)
+                    LogManager.shared.log("nhentai", "CDN \(cdn) works! cached for gallery \(galleryId)")
+                    return result.data
+                }
+                if i == 0 {
+                    let body = String(data: result.data.prefix(200), encoding: .utf8) ?? "(binary)"
+                    LogManager.shared.log("nhentai", "CDN \(cdn): page \(page) status=\(result.status) size=\(result.data.count) body=\(body)")
+                }
+            }
+            if i < fallbackImageCDNs.count - 1 {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+
+        throw URLError(.badServerResponse)
+    }
+
+    /// ページ画像取得（galleryId不明の場合の旧互換API）
+    static func fetchPageImage(mediaId: String, page: Int, ext: String) async throws -> Data {
+        return try await fetchPageImage(galleryId: 0, mediaId: mediaId, page: page, ext: ext)
+    }
+
+    /// サムネ画像取得（低画質モード/プログレッシブロード用）
+    /// 優先順: thumbPath → 既定フォーマット → 全CDNフォールバック
+    static func fetchThumbImage(galleryId: Int, mediaId: String, page: Int, ext: String, thumbPath: String? = nil) async throws -> Data {
+        // 1. v2 thumbPath直接アクセス
+        if let thumbPath {
+            if let url = safeCDNURL(host: "t", path: thumbPath),
+               let result = await fetchRawImage(url: url),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+            // t1-t5 フォールバック
+            for cdnNum in 1...5 {
+                guard let altURL = safeCDNURL(host: "t\(cdnNum)", path: thumbPath) else { continue }
+                if let result = await fetchRawImage(url: altURL),
+                   result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                    return result.data
+                }
+            }
+        }
+
+        // 2. 既定フォーマット (galleries/{mediaId}/{page}t.{ext})
+        if let url = safeCDNURL(host: "t", path: "galleries/\(mediaId)/\(page)t.\(ext)"),
+           let result = await fetchRawImage(url: url),
+           result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+            return result.data
+        }
+
+        // 3. 全CDNフォールバック
+        for cdnNum in 1...5 {
+            guard let altURL = safeCDNURL(host: "t\(cdnNum)", path: "galleries/\(mediaId)/\(page)t.\(ext)") else { continue }
+            if let result = await fetchRawImage(url: altURL),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+        }
+
+        throw URLError(.badServerResponse)
+    }
+
+    /// カバー画像取得（v2 path対応 + 拡張子フォールバック）
+    static func fetchCoverImage(galleryId: Int, mediaId: String, ext: String, path: String? = nil) async throws -> Data {
+        // v2 API二重拡張子バグ修正（例: "cover.webp.webp" → "cover.webp"）
+        var cleanPath = path
+        if let p = path {
+            for e in ["webp", "jpg", "png", "gif"] {
+                let double = ".\(e).\(e)"
+                if p.hasSuffix(double) {
+                    cleanPath = String(p.dropLast(e.count + 1))
+                    break
+                }
+            }
+        }
+        // v2: pathが指定されていればそれを使う
+        if let cleanPath {
+            for cdn in fallbackThumbCDNs {
+                guard let url = safeCDNURL(host: cdn, path: cleanPath) else { continue }
+                if let result = await fetchLightImage(url: url),
+                   result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                    return result.data
+                }
+            }
+        }
+
+        var exts = [ext]
+        for e in ["jpg", "webp", "png"] where e != ext { exts.append(e) }
+
+        for tryExt in exts {
+            guard let url = safeCDNURL(host: "t", path: "galleries/\(mediaId)/cover.\(tryExt)") else { continue }
+            if let result = await fetchLightImage(url: url),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+        }
+
+        throw URLError(.badServerResponse)
+    }
+
+    /// サムネ画像取得（v2 path対応 + 拡張子フォールバック）
+    static func fetchThumbImage(mediaId: String, page: Int, ext: String, path: String? = nil) async throws -> Data {
+        // v2 API二重拡張子バグ修正（例: "2t.webp.webp" → "2t.webp"）
+        var cleanPath = path
+        if let p = path {
+            for e in ["webp", "jpg", "png", "gif"] {
+                let double = ".\(e).\(e)"
+                if p.hasSuffix(double) {
+                    cleanPath = String(p.dropLast(e.count + 1))
+                    break
+                }
+            }
+        }
+        // v2: thumbPathが指定されていればそれを使う
+        if let cleanPath {
+            for cdn in fallbackThumbCDNs {
+                guard let url = safeCDNURL(host: cdn, path: cleanPath) else { continue }
+                if let result = await fetchLightImage(url: url),
+                   result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                    return result.data
+                }
+            }
+        }
+
+        var exts = [ext]
+        for e in ["jpg", "webp", "png"] where e != ext { exts.append(e) }
+
+        for tryExt in exts {
+            guard let url = safeCDNURL(host: "t", path: "galleries/\(mediaId)/\(page)t.\(tryExt)") else { continue }
+            if let result = await fetchLightImage(url: url),
+               result.status == 200 && !result.data.isEmpty && !isHTMLResponse(result.data) {
+                return result.data
+            }
+        }
+
+        throw URLError(.badServerResponse)
+    }
+
+    /// カバー画像取得（galleryId不明の旧互換API）
+    static func fetchCoverImage(mediaId: String, ext: String) async throws -> Data {
+        return try await fetchCoverImage(galleryId: 0, mediaId: mediaId, ext: ext)
+    }
+
+    // MARK: - お気に入り操作（要ログイン）
+
+    /// お気に入り登録/解除トグル（WKWebViewでギャラリーページのfavoriteボタンをJSクリック）
+    static func toggleFavorite(galleryId: Int) async throws -> Bool {
+        let result = try await NhentaiWebBridge.shared.toggleFavoriteViaPage(galleryId: galleryId)
+        LogManager.shared.log("nhentai", "toggleFavorite id=\(galleryId) result=\(result)")
+        return result
+    }
+
+    /// お気に入り1ページ取得（HTML解析）→ (galleries, hasNextPage)
+    static func fetchFavoritesPage(page: Int) async throws -> (galleries: [NhGallery], hasNext: Bool) {
+        guard NhentaiCookieManager.isLoggedIn() else {
+            LogManager.shared.log("nhFav", "not logged in, skipping")
+            return ([], false)
+        }
+
+        LogManager.shared.log("nhFav", "fetching page \(page)...")
+        let urlStr = "https://nhentai.net/api/v2/favorites?page=\(page)"
+
+        // Cookie-only認証を先に試す（Bearer認証は401を返す場合がある）
+        for cookieOnly in [true, false] {
+            do {
+                let data = try await NhentaiWebBridge.shared.fetch(url: urlStr, cookieOnly: cookieOnly)
+                let decoded = try JSONDecoder().decode(NhSearchResult.self, from: data)
+                let hasNext = page < decoded.num_pages
+                // id パース失敗 (id<=0) を除外 (CDN 解決不能 + DL ディレクトリ衝突対策)
+                let valid = decoded.result.filter { $0.id > 0 }
+                LogManager.shared.log("nhFav", "page \(page): \(valid.count) items, hasNext=\(hasNext) cookieOnly=\(cookieOnly)")
+                return (valid, hasNext)
+            } catch {
+                LogManager.shared.log("nhFav", "v2 API failed (cookieOnly=\(cookieOnly)): \(error.localizedDescription)")
+            }
+        }
+        LogManager.shared.log("nhFav", "v2 API all attempts failed, falling back to HTML")
+
+        // フォールバック: HTML解析
+        let htmlUrlStr = "https://nhentai.net/favorites/?page=\(page)"
+        let (html, status) = try await NhentaiWebBridge.shared.fetchHTML(url: htmlUrlStr)
+
+        guard !html.isEmpty else {
+            LogManager.shared.log("nhFav", "page \(page): empty HTML")
+            return ([], false)
+        }
+
+        LogManager.shared.log("nhFav", "page \(page): status=\(status) html=\(html.count) chars")
+
+        var ids: [Int] = []
+        let idPattern = #"/g/(\d+)/"#
+        if let regex = try? NSRegularExpression(pattern: idPattern) {
+            let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+            for match in matches {
+                if let range = Range(match.range(at: 1), in: html), let id = Int(html[range]) {
+                    if !ids.contains(id) { ids.append(id) }
+                }
+            }
+        }
+
+        let hasNext = html.contains("page=\(page + 1)") || html.contains("class=\"next\"")
+
+        var galleries: [NhGallery] = []
+        for (i, id) in ids.enumerated() {
+            if let g = try? await fetchGallery(id: id) {
+                galleries.append(g)
+            }
+            if i < ids.count - 1 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+
+        LogManager.shared.log("nhFav", "page \(page): \(galleries.count)/\(ids.count) resolved, hasNext=\(hasNext)")
+        return (galleries, hasNext)
+    }
+
+    /// お気に入り全件取得（全ページ巡回）
+    static func fetchAllFavorites() async throws -> [NhGallery] {
+        var all: [NhGallery] = []
+        // ページ境界ズレで同 id が複数ページに混入し得るため全ページ横断で dedupe
+        // (重複が永続化されると FavoritesView の Dictionary(uniqueKeysWithValues:) がクラッシュ)
+        var seenIds = Set<Int>()
+        var page = 1
+
+        while true {
+            let (galleries, hasNext) = try await fetchFavoritesPage(page: page)
+            all.append(contentsOf: galleries.filter { seenIds.insert($0.id).inserted })
+            if !hasNext || galleries.isEmpty { break }
+            page += 1
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // ページ間1秒
+        }
+
+        LogManager.shared.log("nhentai", "favorites total: \(all.count) items (\(page) pages)")
+        return all
+    }
+
+    /// お気に入り一覧取得（旧互換API）
+    static func fetchFavorites(page: Int = 1) async throws -> [NhGallery] {
+        let (galleries, _) = try await fetchFavoritesPage(page: page)
+        return galleries
+    }
+
+    // MARK: - ヘルパー
+
+    /// E-Hentaiタイトルからnhentai検索クエリを生成
+    static func buildSearchQuery(from title: String) -> String {
+        var q = title
+        // [サークル名] を除去
+        q = q.replacingOccurrences(of: #"\[[^\]]*\]"#, with: "", options: .regularExpression)
+        // (イベント名) を除去
+        q = q.replacingOccurrences(of: #"\([^)]*\)"#, with: "", options: .regularExpression)
+        // | 以降を除去
+        if let barIndex = q.firstIndex(of: "|") {
+            q = String(q[q.startIndex..<barIndex])
+        }
+        return q.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// CDNキャッシュクリア
+    static func clearCDNCache() {
+        cdnCacheLock.lock(); defer { cdnCacheLock.unlock() }
+        cdnCache.removeAll()
+    }
+}

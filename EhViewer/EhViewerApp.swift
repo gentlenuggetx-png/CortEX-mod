@@ -1,0 +1,394 @@
+import SwiftUI
+import UserNotifications
+import TipKit
+import CryptoKit
+#if canImport(UIKit)
+import UIKit
+#endif
+
+#if canImport(UIKit)
+class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// 回転制御フラグ（コレクションモード時に.portraitに制限）
+    static var orientationLock: UIInterfaceOrientationMask = .all
+
+    /// プライバシー保護用Window
+    private var privacyWindow: UIWindow?
+
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        return AppDelegate.orientationLock
+    }
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // AppSwitcherプライバシー保護
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification, object: nil
+        )
+        #if targetEnvironment(macCatalyst)
+        // Catalyst のタイトルバー下に出る 1px separator を消す。
+        // UINavigationBarAppearance の shadowColor = .clear で navigation bar 側、
+        // UIScene.willConnect で windowScene.titlebar 側、両方消す。
+        let appearance = UINavigationBarAppearance()
+        appearance.configureWithDefaultBackground()
+        appearance.shadowColor = .clear
+        appearance.shadowImage = UIImage()
+        UINavigationBar.appearance().standardAppearance = appearance
+        UINavigationBar.appearance().compactAppearance = appearance
+        UINavigationBar.appearance().scrollEdgeAppearance = appearance
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(hideTitlebarSeparator),
+            name: UIScene.willConnectNotification, object: nil
+        )
+        #endif
+        return true
+    }
+
+    #if targetEnvironment(macCatalyst)
+    @objc private func hideTitlebarSeparator(_ note: Notification) {
+        DispatchQueue.main.async {
+            for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+                scene.titlebar?.titleVisibility = .hidden
+                scene.titlebar?.toolbar = nil
+            }
+        }
+    }
+    #endif
+
+    @objc private func appWillResignActive() {
+        showPrivacyScreen()
+    }
+
+    @objc private func appDidBecomeActive() {
+        hidePrivacyScreen()
+    }
+
+    private func showPrivacyScreen() {
+        guard privacyWindow == nil else { return }
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first else { return }
+
+        let window = UIWindow(windowScene: scene)
+        window.windowLevel = .alert + 1
+        window.rootViewController = PrivacyViewController()
+        window.isHidden = false
+        privacyWindow = window
+    }
+
+    private func hidePrivacyScreen() {
+        privacyWindow?.isHidden = true
+        privacyWindow = nil
+    }
+
+    // フォアグラウンド通知
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// バックグラウンドURLSession完了通知 → BackgroundDownloadManagerへ転送
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        BackgroundDownloadManager.shared.handleEventsForBackgroundURLSession(
+            identifier: identifier,
+            completionHandler: completionHandler
+        )
+    }
+}
+
+/// プライバシー保護画面のViewController
+private class PrivacyViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        // ブラー背景
+        let blurEffect = UIBlurEffect(style: .systemThickMaterialDark)
+        let blurView = UIVisualEffectView(effect: blurEffect)
+        blurView.frame = view.bounds
+        blurView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(blurView)
+
+        // アイコン + テキスト
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = UIImageView(image: UIImage(systemName: "eye.slash.fill"))
+        icon.tintColor = UIColor.gray.withAlphaComponent(0.6)
+        icon.contentMode = .scaleAspectFit
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 50).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 50).isActive = true
+
+        let label = UILabel()
+        label.text = "Cort:EX"
+        label.font = .systemFont(ofSize: 22, weight: .bold)
+        label.textColor = UIColor.gray.withAlphaComponent(0.5)
+
+        stack.addArrangedSubview(icon)
+        stack.addArrangedSubview(label)
+
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+        ])
+    }
+}
+#endif
+
+@main
+struct EhViewerApp: App {
+    #if canImport(UIKit)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #endif
+    @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        // Phase 2C: BGProcessingTask handler 登録。
+        // Apple 仕様で SceneDelegate / AppDelegate lifecycle 完了前に register 必須。
+        // Info.plist の BGTaskSchedulerPermittedIdentifiers に同一 id 登録済み前提。
+        #if canImport(BackgroundTasks) && !targetEnvironment(macCatalyst)
+        BackgroundDownloadManager.registerBGProcessingHandler()
+        #endif
+
+        // メモリ枯渇を OS の memoryWarning より早く段階検知し、可視ページの体感を
+        // 落とさず先回り解放する (warning=soft trim / critical=全力解放)。田中要望 2026-06-09。
+        MemoryPressureMonitor.shared.start()
+
+        // 既存ユーザーのdownloadQualityModeを0→2に移行（register前に実行）
+        if !UserDefaults.standard.bool(forKey: UDKey.dlQualityMigrated2) {
+            // 明示的に保存された値がなければ2をセット、0なら2に上書き
+            if UserDefaults.standard.object(forKey: UDKey.downloadQualityMode) == nil
+                || UserDefaults.standard.integer(forKey: UDKey.downloadQualityMode) == 0 {
+                UserDefaults.standard.set(2, forKey: UDKey.downloadQualityMode)
+            }
+            UserDefaults.standard.set(true, forKey: UDKey.dlQualityMigrated2)
+        }
+
+        // UserDefaultsのデフォルト値を登録（Bundle ID変更や初回起動時に必要）
+        UserDefaults.standard.register(defaults: [
+            UDKey.onlineQualityMode: 2,
+            UDKey.downloadQualityMode: 2,
+            UDKey.noFilterMode: false,
+            // アニメ per-frame NE 人物セグメンテーション (本命機能、デフォルト ON)
+            // プリロード再生 (default ON)。SwiftUI @AppStorage の default は読み出し時にしか効かず、
+            // ユーザがトグル操作するまで UserDefaults 本体には書き込まれない。
+            // UIImageView 側 (UIKit) から `bool(forKey:)` で読むと未登録 → false が返り、
+            // rolling timer の `if !preloadOn` 分岐に入って ultraFugen で retainOnly が動作 →
+            // preload した frame が即 evict されて再生中 miss が大量発生する根本原因 (2026-04-25)。
+            UDKey.preloadPlayback: true,
+            // 同じパターンで Boomerang Mode も UIView 側から読まれているので併せて register。
+            UDKey.boomerangMode: true,
+        ])
+
+        ImageCache.shared.cleanupOnLaunch()
+        GalleryExporter.cleanupOldExportFiles()
+        cleanupGalleryWebPTmp()
+
+        // v02a-f7 緊急セキュリティ migration:
+        // v02a-f6 以前のビルドには DEBUG 注入 block が含まれており、
+        // 特定の E-Hentai credentials が Keychain に自動保存されていた。
+        // 新バイナリでは注入コードを削除したが、以前 install した端末の
+        // Keychain には残骸が残るため、起動時に hash 照合で検出して自動削除する。
+        // ここで記録する hash は SHA256 の hex string なので、credentials の平文は含まない。
+        //
+        // 2026-04-25 無効化: ユーザー本人の正規 credentials が 4/23 流出 hash と完全一致する
+        // ケース (ipb_member_id は不変、pass_hash/igneous も reset していなければ同値) で
+        // 起動毎に 3/3 purge 発火 → 毎回ログアウトする実害のみが残った。migration は
+        // 既に役目を終えているため呼び出しを停止。関数定義は履歴として残置。
+        // purgeCompromisedDebugCredentials()
+
+        // Keychain accessibility migration (既存 cookie を BG 可能 accessibility に書き直す)
+        KeychainService.migrateAccessibility()
+        // animated_cache 上限 500MB、超えてたら LRU eviction
+        Task.detached(priority: .utility) {
+            WebPToMP4Converter.enforceCacheCap()
+        }
+        LogManager.shared.log("CoreML", "modelAvailable: \(CoreMLImageProcessor.shared.modelAvailable)")
+
+        #if DEBUG
+        HTMLParserTests.runAll()
+        #endif
+
+        // Foundation Models可用性チェック（iOS 26+）
+        _ = AIFeatures.shared
+
+        // 通知許可
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error {
+                LogManager.shared.log("Notification", "auth error: \(error)")
+            } else {
+                LogManager.shared.log("Notification", "auth granted: \(granted)")
+            }
+        }
+
+        // TipKit初期化（初回のみ表示）
+        if !UserDefaults.standard.bool(forKey: UDKey.tipsShownOnce) {
+            try? Tips.resetDatastore()
+            UserDefaults.standard.set(true, forKey: UDKey.tipsShownOnce)
+        }
+        try? Tips.configure([
+            .displayFrequency(.immediate)
+        ])
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+            .task {
+                // main 停滞の定量化 (250ms 超のみログ → スクロールヒッチ調査用)
+                MainStallMonitor.shared.start()
+                // 凍結瞬間の main スタック採取 (診断用、main から呼ぶこと)
+                MainBlockSampler.shared.start()
+                // お気に入りキャッシュの ID Set を背景で温める (初回 contains の main デコード回避)
+                FavoritesCache.shared.warmUpInBackground()
+                NhentaiFavoritesCache.shared.warmUpInBackground()
+                FavoritesViewModel.prefetchCachedFavorites()
+                Task.detached(priority: .utility) {
+                    ImageCache.shared.prewarmRecentThumbs()
+                }
+            }
+            .onAppear {
+                #if canImport(UIKit)
+                UNUserNotificationCenter.current().delegate = appDelegate
+                LogManager.shared.startFrameMonitor()
+                #endif
+                // ShikigamiKit 弾① (指示書 Phase 1)。EhViewer 固有情報を注入して start。
+                // ゲート(cortexUnlocked)OFF or 送信先空なら engine 内で完全休眠する。
+                let sk = ShikigamiEngine.shared
+                sk.gateProvider = { UserDefaults.standard.bool(forKey: UDKey.cortexProtocolUnlocked) }
+                sk.destinationProvider = { UserDefaults.standard.string(forKey: UDKey.shikigamiDestination) ?? "" }
+                sk.libraryCountProvider = { DownloadManager.shared.downloads.count }
+                // r008 (2026-07-21): +dirty のままだと連投中どの修正版か打電から判別できない。
+                // hash に加えビルド時刻 (BuildInfo.tag 先頭の日付時刻) を付けて版を一意にする。
+                sk.buildVersionProvider = {
+                    // BuildInfo.tag = "日付 時刻 <hash> \"msg\"" → "<hash>@時刻" で版を一意化。
+                    // +dirty の連投でも時刻で判別できる (r008)。
+                    let p = BuildInfo.tag.split(separator: " ")
+                    guard p.count >= 3 else { return "unknown" }
+                    let hhmm = p[1].prefix(5)   // "HH:MM"
+                    return "\(p[2])@\(hhmm)"
+                }
+                // 画質/AI超解像トグルのスナップショット (田中指示: 状態を打電に含める)
+                sk.settingsProvider = {
+                    let q = UserDefaults.standard.integer(forKey: UDKey.onlineQualityMode)
+                    let ai = UserDefaults.standard.bool(forKey: UDKey.aiImageProcessing) ? 1 : 0
+                    return "q\(q)ai\(ai)"
+                }
+                sk.start()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                CoreMLImageProcessor.shared.isAppActive = (newPhase == .active)
+                if newPhase == .active {
+                    LogManager.shared.log("App", "scene active")
+                }
+                // Catch-all: アプリ非アクティブ化で全アニメ再生停止。
+                // reader の .onDisappear が取りこぼすケース (App Switcher など) でも確実に止める。
+                if newPhase != .active {
+                    AnimatedPlaybackCoordinator.shared.stopAll()
+                }
+            }
+        }
+    }
+}
+
+/// v02a-f7 緊急セキュリティ migration:
+/// v02a-f6 以前の DEBUG 注入 block で Keychain に保存された compromised credentials を
+/// hash 照合で検出して自動削除する。平文は一切含まない（hash 値のみ）。
+///
+/// 検出ロジック: 保存されている ipb_member_id / ipb_pass_hash / igneous それぞれを
+/// SHA256 にかけて、旧流出値の hash と一致したらその key を削除。
+/// 3 つ全てが一致した場合は DEBUG block 経由で注入された残骸と断定して全削除。
+/// 一致ゼロなら何もしない（ユーザー自身が正規にログインした credentials は触らない）。
+///
+/// 実行は起動毎。コスト: Keychain 読み 3 回 + SHA256 計算 3 回 / 起動。
+/// 二度目以降は流出値と不一致で何もしないので実害なし。冪等性優先で migration flag は使わない。
+private func purgeCompromisedDebugCredentials() {
+    // v02a-f6 以前の DEBUG 注入 block に含まれていた値の SHA256 hex。
+    // 計算: echo -n "<value>" | shasum -a 256
+    // 平文は含めない。GitHub 曝露済みだが hash のみ埋め込みでスキャナと整合性を保つ。
+    let compromisedHashes: [String: String] = [
+        "ipb_member_id":  "478a2d3b969e8fa582dfcb001f8ee0a5e4320ce7f7c3a795e1fa856b6d25628b",
+        "ipb_pass_hash":  "ccdbe1205dd8bb7f605335280ce19e99701f15b9dc3539780055b7676b62b4ff",
+        "igneous":        "96b04342d8cabb7e19a2ef6469465f32e92039a72ee7f197bb5470da36d7135b",
+    ]
+    func sha256Hex(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    var matchedKeys: [String] = []
+    for (key, expectedHash) in compromisedHashes {
+        guard let value = KeychainService.load(key: key) else { continue }
+        if sha256Hex(value) == expectedHash {
+            matchedKeys.append(key)
+        }
+    }
+    // 修正 2026-04-25: 3 つ全部一致時のみ purge に変更。
+    // 以前は「部分一致でも削除」にしていたが、ipb_member_id はユーザーアカウント固有の
+    // 安定 ID なのでパスワード変更後の再ログインでも同一値 → memberID 単独の hash 一致が
+    // 常時成立し、起動毎に全 Keychain 削除 → 毎起動ログアウトのバグが発生していた。
+    // DEBUG 注入の完全な残骸は 3 値とも同時に流出値 → 全一致を要件に戻す。
+    guard matchedKeys.count == compromisedHashes.count else {
+        if !matchedKeys.isEmpty {
+            LogManager.shared.log("Security", "partial compromised hash match (\(matchedKeys.count)/3): keys=\(matchedKeys.joined(separator: ",")). NOT purging (likely legitimate re-login with same account).")
+        }
+        return
+    }
+    LogManager.shared.log("Security", "ALL compromised DEBUG credentials detected in Keychain (3/3). Purging.")
+    KeychainService.deleteAll()
+    // HTTPCookieStorage 側にも念のため痕跡があれば削除
+    if let cookies = HTTPCookieStorage.shared.cookies {
+        for cookie in cookies {
+            let d = cookie.domain.lowercased()
+            if d.contains("exhentai") || d.contains("e-hentai") || d.contains("hath.network") {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
+        }
+    }
+    LogManager.shared.log("Security", "purge complete. User must re-login.")
+}
+
+/// 起動時の tmp/ 掃除: クラッシュ / 強制終了で残る一時ファイルを一括削除。
+/// 対象:
+/// - `gallery_webp_*` (GalleryAnimatedWebPView が書き出した onDisappear 漏れ)
+/// - `CFNetworkDownload_*.tmp` (URLSession downloadTask の未完了テンポラリ、アプリ強制終了時リーク)
+/// - `CoordinatedZipFile*` (.cortex export 進行中のステージングフォルダ、共有シート未完了で残存)
+/// - `bg-html-*.tmp` (BackgroundDownloadManager の BG HTML fetch テンポラリ)
+@MainActor
+private func cleanupGalleryWebPTmp() {
+    let tmp = FileManager.default.temporaryDirectory
+    guard let items = try? FileManager.default.contentsOfDirectory(
+        at: tmp, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]
+    ) else { return }
+    var removed = 0
+    var freed: Int64 = 0
+    for url in items {
+        let name = url.lastPathComponent
+        let matches = name.hasPrefix("gallery_webp_")
+            || name.hasPrefix("CFNetworkDownload_")
+            || name.hasPrefix("CoordinatedZipFile")
+            || name.hasPrefix("bg-html-")
+        guard matches else { continue }
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if (try? FileManager.default.removeItem(at: url)) != nil {
+            removed += 1
+            freed += Int64(size)
+        }
+    }
+    if removed > 0 {
+        LogManager.shared.log("App", "cleanup tmp: \(removed) items, \(freed / 1024 / 1024)MB")
+    }
+}

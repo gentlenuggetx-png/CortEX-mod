@@ -1,0 +1,332 @@
+import Foundation
+import Combine
+import SwiftUI
+
+enum FavoritesSort: String, CaseIterable {
+    case dateDesc = "追加日・新しい順"
+    case dateAsc = "追加日・古い順"
+    case title = "タイトル順"
+}
+
+@MainActor
+class FavoritesViewModel: ObservableObject {
+    @Published var galleries: [Gallery] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+    @Published var hasMore = false
+    @Published var totalLoaded: Int = 0
+    @Published var selectedCategory: Int = -1
+    @Published var searchText: String = ""
+    @Published var sortOrder: FavoritesSort = .dateDesc
+    @Published var isFromCache = false
+    @Published var lastUpdatedText: String = ""
+    let host: GalleryHost = .exhentai
+
+    private let client = EhClient.shared
+    private let cache = FavoritesCache.shared
+    private var nextPageURL: String?
+    var allGalleries: [Gallery] = []
+
+    /// 直近ローカル登録 (gid → 登録時刻)。E-H はお気に入り POST 後の favorites.php 反映に
+    /// 数秒〜十数秒のラグがある (2026-07-02 実機ログで実測)。この間に refresh すると
+    /// 「サーバ1ページ目に無い」扱いで削除クリーンアップに食われるため、5 分間保護する。
+    private var recentLocalAdds: [Int: Date] = [:]
+    private var cacheChangeObserver: NSObjectProtocol?
+
+    init() {
+        // 詳細/リーダーのお気に入りトグルを表示中一覧へ即時反映 (2026-07-02)。
+        // 従来はファイル (FavoritesCache) だけ更新され、この VM のメモリ配列に反映されず、
+        // 次の refresh の cache.save(メモリ) でファイル側の追加が丸上書きで消えていた
+        // (lost update)。これが「iPad で登録したのに一覧に出ない/消える」の真因。
+        cacheChangeObserver = NotificationCenter.default.addObserver(
+            forName: .ehFavoritesCacheDidChange, object: nil, queue: .main
+        ) { [weak self] note in
+            let action = note.userInfo?["action"] as? String
+            let gid = note.userInfo?["gid"] as? Int
+            let gallery = note.userInfo?["gallery"] as? Gallery
+            Task { @MainActor in
+                self?.applyLocalCacheChange(action: action, gid: gid, gallery: gallery)
+            }
+        }
+    }
+
+    deinit {
+        if let o = cacheChangeObserver { NotificationCenter.default.removeObserver(o) }
+    }
+
+    private func applyLocalCacheChange(action: String?, gid: Int?, gallery: Gallery?) {
+        guard let action, let gid else { return }
+        switch action {
+        case "add":
+            recentLocalAdds[gid] = Date()
+            guard let gallery, !allGalleries.contains(where: { $0.gid == gid }) else { return }
+            allGalleries.insert(gallery, at: 0)
+        case "remove":
+            recentLocalAdds[gid] = nil
+            allGalleries.removeAll { $0.gid == gid }
+        default:
+            return
+        }
+        totalLoaded = allGalleries.count
+        galleries = displayGalleries
+    }
+
+    /// サーバ反映ラグ保護: 直近 5 分以内にローカル登録した gid は削除クリーンアップ対象外
+    private func isProtectedLocalAdd(_ gid: Int) -> Bool {
+        guard let t = recentLocalAdds[gid] else { return false }
+        return Date().timeIntervalSince(t) < 300
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    private func parsePostedDate(_ s: String) -> Date {
+        Self.dateFormatter.date(from: s) ?? .distantPast
+    }
+
+    var displayGalleries: [Gallery] {
+        var result = allGalleries
+
+        if !searchText.isEmpty {
+            let query = searchText.lowercased()
+            result = result.filter { $0.title.lowercased().contains(query) }
+        }
+
+        switch sortOrder {
+        case .dateDesc: break
+        case .dateAsc: result.reverse()
+        case .title: result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        }
+
+        return result
+    }
+
+    /// キャッシュからのみ表示
+    func loadFromCacheOnly() {
+        let cached = cache.load()
+        if !cached.isEmpty {
+            allGalleries = cached
+            totalLoaded = cached.count
+            galleries = displayGalleries
+            isFromCache = true
+        }
+        updateLastUpdatedText()
+    }
+
+    /// 差分更新: キャッシュが空なら全件取得、あれば1ページ差分
+    func refreshFromServer() async {
+        // キャッシュが空（初回 or 再インストール後）→ 全件取得
+        if allGalleries.isEmpty {
+            await fullRefreshFromServer()
+            return
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            let result = try await client.fetchFavorites(host: host, category: selectedCategory, page: 0)
+            let serverFirst = result.galleries
+            let serverGids = Set(serverFirst.map { $0.gid })
+
+            // キャッシュの既存データ
+            var merged = allGalleries
+
+            // 1. サーバーの1ページ目にあるがキャッシュにないものを先頭に追加
+            let cachedGids = Set(merged.map { $0.gid })
+            var newItems: [Gallery] = []
+            for g in serverFirst {
+                if !cachedGids.contains(g.gid) {
+                    newItems.append(g)
+                }
+            }
+            if !newItems.isEmpty {
+                merged.insert(contentsOf: newItems, at: 0)
+            }
+
+            // 2. サーバーの1ページ目にないがキャッシュの先頭付近にあるものを削除
+            //    （お気に入りから外されたケース。ただし2ページ目以降のものは残す）
+            let firstPageSize = serverFirst.count
+            if firstPageSize > 0 && merged.count > firstPageSize {
+                // キャッシュの先頭firstPageSize件の中で、サーバーにないものを削除
+                var cleaned: [Gallery] = []
+                for (i, g) in merged.enumerated() {
+                    if i < firstPageSize + newItems.count {
+                        // 先頭エリア: サーバーにあるものだけ残す
+                        // (直近ローカル登録はサーバ反映ラグで1ページ目に未出現でも消さない)
+                        if serverGids.contains(g.gid) || i >= firstPageSize || isProtectedLocalAdd(g.gid) {
+                            cleaned.append(g)
+                        }
+                    } else {
+                        // 後方: そのまま残す
+                        cleaned.append(g)
+                    }
+                }
+                merged = cleaned
+            }
+
+            // ファイル側にしか無い gid (前回 save 以降に詳細/リーダーから登録された分) を
+            // cache.save(メモリ) の丸上書きで喪失させない (2026-07-02 lost-update 対策)。
+            // load はフルデコードで main を 100ms 級に塞ぐため detached で行う。
+            let fileList = await Task.detached { FavoritesCache.shared.load() }.value
+            let mergedGids = Set(merged.map { $0.gid })
+            let fileOnly = fileList.filter { !mergedGids.contains($0.gid) }
+            if !fileOnly.isEmpty {
+                merged.insert(contentsOf: fileOnly, at: 0)
+                LogManager.shared.log("Favorite", "refresh: file-only \(fileOnly.count) 件を復元 (lost-update 防止)")
+            }
+
+            allGalleries = merged
+            totalLoaded = allGalleries.count
+            galleries = displayGalleries
+            isFromCache = false
+            cache.save(allGalleries)
+            LogManager.shared.log("Perf", "refreshFromServer: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms total=\(allGalleries.count) new=\(newItems.count)")
+
+            // サムネをバックグラウンドでプリフェッチ
+            Task(priority: .background) {
+                await Self.prefetchThumbnails(merged)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+        updateLastUpdatedText()
+    }
+
+    /// 全件再取得（設定画面から呼ぶ）
+    func fullRefreshFromServer() async {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        isLoading = true
+        errorMessage = nil
+        isFromCache = false
+
+        var serverGalleries: [Gallery] = []
+
+        do {
+            let first = try await client.fetchFavorites(host: host, category: selectedCategory, page: 0)
+            serverGalleries = first.galleries
+            var nextURL = first.pageNumber.nextURL
+            var hasMorePages = first.pageNumber.hasNext
+            // ページ横断の gid dedupe (差分側 refreshFromServer と同形)。
+            // ページング中にサーバー側で件数が動くと同 gid が複数ページに跨って返り、
+            // LazyVGrid + .id(gid) の重複でrow 抜け / 空白化する対策 (2026-06-10 fix)。
+            var seenGids = Set(serverGalleries.map { $0.gid })
+
+            allGalleries = serverGalleries
+            totalLoaded = allGalleries.count
+            galleries = displayGalleries
+
+            while hasMorePages {
+                guard let url = nextURL else { break }
+                await SafetyMode.shared.delay(nanoseconds: 2_000_000_000)
+
+                let result = try await client.fetchByURL(urlString: url, host: host)
+                if result.galleries.isEmpty { break }
+
+                let deduped = result.galleries.filter { seenGids.insert($0.gid).inserted }
+                serverGalleries.append(contentsOf: deduped)
+                nextURL = result.pageNumber.nextURL
+                hasMorePages = result.pageNumber.hasNext
+
+                allGalleries = serverGalleries
+                totalLoaded = allGalleries.count
+                galleries = displayGalleries
+            }
+
+            cache.save(serverGalleries)
+            LogManager.shared.log("Reader", "favorites full refresh: \(serverGalleries.count) items saved")
+            LogManager.shared.log("Perf", "fullRefreshFromServer: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms total=\(serverGalleries.count)")
+
+            // サムネをバックグラウンドでプリフェッチ
+            Task(priority: .background) {
+                await Self.prefetchThumbnails(serverGalleries)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+        updateLastUpdatedText()
+    }
+
+    func applyFilter() {
+        galleries = displayGalleries
+    }
+
+    // MARK: - サムネプリフェッチ
+
+    /// サムネをバッチ並列プリフェッチ（background priority）
+    /// nonisolated (2026-06-10 BlockSample 実測): 暗黙 @MainActor のままだとフィルタ/バッチ
+    /// ループが main で走り 50ms 級の停滞源だった (ImageCache/EhClient は nonisolated 済み)
+    nonisolated static func prefetchThumbnails(_ galleries: [Gallery]) async {
+        let urls = galleries.compactMap(\.coverURL).filter { url in
+            ImageCache.shared.image(for: url) == nil && !ImageCache.shared.isLoading(url)
+        }
+        guard !urls.isEmpty else { return }
+        LogManager.shared.log("Download", "\(urls.count) thumbnails to prefetch")
+
+        // セーフティ ON (default): 6 並列で保守的 / OFF: 15 並列 (旧 Extreme 相当)
+        // (isEnabled は @MainActor。暗黙時代もここで main へホップして読んでいたので await 明示)
+        let safetyOn = await SafetyMode.shared.isEnabled
+        let batchSize = safetyOn ? 6 : 15
+        for batchStart in stride(from: 0, to: urls.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, urls.count)
+            let batch = Array(urls[batchStart..<batchEnd])
+
+            await withTaskGroup(of: Void.self) { group in
+                for url in batch {
+                    group.addTask {
+                        guard !ImageCache.shared.isLoading(url) else { return }
+                        ImageCache.shared.setLoading(url)
+                        defer { ImageCache.shared.removeLoading(url) }
+                        do {
+                            let data = try await EhClient.shared.fetchThumbData(url: url, host: .exhentai)
+                            #if canImport(UIKit)
+                            // GPU経由デコード（CachedImageViewと同じパターン）
+                            let ciCtx = SpriteCache.ciContext
+                            if let ciImage = CIImage(data: data),
+                               let cgImage = SpriteCache.makeDisplayCGImage(ciImage) {
+                                ImageCache.shared.setThumb(UIImage(cgImage: cgImage), for: url)
+                                return
+                            }
+                            #endif
+                            // GPUフォールバック
+                            if let image = PlatformImage(data: data) {
+                                ImageCache.shared.setThumb(image, for: url)
+                            }
+                        } catch {}
+                    }
+                }
+            }
+        }
+        LogManager.shared.log("Download", "done")
+    }
+
+    /// 起動時にFavoritesCacheの未キャッシュサムネをプリフェッチ（最初の画面分のみ）
+    static func prefetchCachedFavorites() {
+        let cached = FavoritesCache.shared.load()
+        guard !cached.isEmpty else { return }
+        // セーフティ ON: 20 件まで絞る (BAN 予防) / OFF: 50 件 (旧挙動)
+        let limit = SafetyMode.shared.isEnabled ? 20 : 50
+        let visible = Array(cached.prefix(limit))
+        Task(priority: .background) {
+            await prefetchThumbnails(visible)
+        }
+    }
+
+    private func updateLastUpdatedText() {
+        if let date = cache.lastUpdated() {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.locale = Locale.current
+            lastUpdatedText = formatter.localizedString(for: date, relativeTo: Date())
+        } else {
+            lastUpdatedText = "未取得"
+        }
+    }
+}

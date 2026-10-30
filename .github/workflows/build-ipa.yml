@@ -1,0 +1,38 @@
+# Builds an unsigned CortEX-mod.ipa on every push to main (or by hand from the Actions tab).
+# Download it from the run's "Artifacts" section, then sign + install with Sideloadly/AltStore.
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project EhViewer.xcodeproj -scheme EhViewer \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/EhViewer.app Payload/
+          zip -qry CortEX-mod.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CortEX-mod-ipa
+          path: CortEX-mod.ipa

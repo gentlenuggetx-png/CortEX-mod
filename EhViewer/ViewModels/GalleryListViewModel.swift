@@ -1,0 +1,200 @@
+import Foundation
+import Combine
+import SwiftUI
+
+@MainActor
+class GalleryListViewModel: ObservableObject {
+    @Published var galleries: [Gallery] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+    @Published var searchText: String = ""
+    @Published var hasMore: Bool = false
+    /// 田中報告 2026-05-30: プルダウン更新 / 検索でデータを総入れ替えした時に List の
+    /// スクロール位置を先頭へ戻すためのトークン。reset:true の取得が成功するたびに +1。
+    /// (append ページングでは bump しない＝途中までスクロールした位置を維持する)
+    @Published var scrollResetToken: Int = 0
+    var host: GalleryHost = .exhentai
+
+    /// カテゴリフィルタ（f_cats値）。nilなら全カテゴリ
+    var categoryFilter: Int?
+    /// 検索クエリに追加する固定条件（例: "language:japanese"）
+    var baseQuery: String?
+    /// 最低評価フィルタ (2〜5 = N★以上のみ表示。nil=なし)。E-H の f_sr/f_srdd に対応。
+    var minRating: Int?
+
+    private let client = EhClient.shared
+    private var nextPageURL: String?
+    private var currentPage: Int = 0
+    private var cacheKey: String?
+
+    /// 検索 race 対策 (2026-04-27): Enter 連打 / 連続検索で前のリクエストを cancel。
+    /// URLSession async API は Task キャンセル時に in-flight HTTP も中断する。
+    private var searchTask: Task<Void, Never>?
+
+    func loadGalleries(reset: Bool = true) async {
+        if reset {
+            currentPage = 0
+            nextPageURL = nil
+        }
+
+        // まずキャッシュから即表示（reset時のみ）
+        if reset, galleries.isEmpty {
+            let key = listCacheKey()
+            cacheKey = key
+            if let cached = Self.loadListCache(key: key) {
+                galleries = cached
+                LogManager.shared.log("Reader", "gallery list: \(cached.count) items from list cache")
+            } else {
+                // 一覧キャッシュなし → お気に入りキャッシュで仮表示
+                let favs = FavoritesCache.shared.load()
+                if !favs.isEmpty {
+                    galleries = favs
+                    LogManager.shared.log("Reader", "gallery list: \(favs.count) items from favorites cache (placeholder)")
+                }
+            }
+        }
+
+        // キャッシュ/お気に入りで仮表示中はスピナー非表示
+        if galleries.isEmpty {
+            isLoading = true
+        }
+        // isLoading=true の残留防止 (2026-06-10 fix): キャンセル3経路
+        // (fetch 後の isCancelled return / CancellationError / URLError.cancelled) は
+        // 早期 return するため、末尾の isLoading=false に到達せず true が残り、
+        // loadNextPage の guard !isLoading が以後永久に弾いていた。
+        // 結果の反映ガード (return 自体) は従来通り維持し、解除だけ defer で保証する。
+        defer { isLoading = false }
+        errorMessage = nil
+
+        let start = CFAbsoluteTimeGetCurrent()
+        do {
+            let result: (galleries: [Gallery], pageNumber: PageNumber)
+
+            if !reset, let nextURL = nextPageURL {
+                result = try await client.fetchByURL(urlString: nextURL, host: host)
+            } else {
+                let query = buildQueryWithTagTranslation()
+                result = try await client.fetchGalleryList(
+                    host: host, page: currentPage,
+                    searchQuery: query, categoryFilter: categoryFilter, minRating: minRating
+                )
+            }
+
+            // 検索 race 対策: 後続の search() で cancel 済みなら結果を反映せず終了。
+            if Task.isCancelled { return }
+
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            LogManager.shared.log("Reader", "gallery list: \(result.galleries.count) items in \(String(format: "%.0f", elapsed))ms")
+            LogManager.shared.log("Perf", "loadGalleries: \(Int(elapsed))ms count=\(result.galleries.count) page=\(currentPage) reset=\(reset)")
+
+            if reset {
+                galleries = result.galleries
+                // データ総入れ替え → List を先頭へ戻す (新着が上に隠れる / 検索で前の位置が残る対策)
+                scrollResetToken += 1
+                // キャッシュ保存
+                if let key = cacheKey {
+                    Self.saveListCache(result.galleries, key: key)
+                }
+            } else {
+                // 田中報告 2026-04-27: 言ったり戻ったりで galleries に同 gid が入ると
+                // LazyVGrid + .id(gid) で SwiftUI が同一 view と見なし row 抜け / 空白化。
+                // append 時に重複除外 (B3: nh 側と共通の appendDeduplicated)。
+                let skipped = galleries.appendDeduplicated(result.galleries)
+                if skipped > 0 {
+                    LogManager.shared.log("GalleryList", "dedupe append: skipped \(skipped) dup of \(result.galleries.count)")
+                }
+            }
+            nextPageURL = result.pageNumber.nextURL
+            hasMore = result.pageNumber.hasNext
+        } catch is CancellationError {
+            return
+        } catch let urlErr as URLError where urlErr.code == .cancelled {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        // isLoading の解除は冒頭の defer が全経路 (キャンセル含む) で保証する
+    }
+
+    // MARK: - 一覧キャッシュ
+
+    private func listCacheKey() -> String {
+        let query = buildQuery() ?? ""
+        let cat = categoryFilter.map(String.init) ?? "all"
+        return "list_\(cat)_\(query)".replacingOccurrences(of: " ", with: "_")
+    }
+
+    /// 純関数 (FileManager は thread-safe)。detached 保存タスクからも呼ぶため nonisolated
+    nonisolated private static func cacheDir() -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("EhViewer/listcache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private static func saveListCache(_ galleries: [Gallery], key: String) {
+        Task.detached(priority: .utility) {
+            let path = cacheDir().appendingPathComponent("\(key).json")
+            if let data = try? JSONEncoder().encode(galleries) {
+                try? data.write(to: path)
+            }
+        }
+    }
+
+    private static func loadListCache(key: String) -> [Gallery]? {
+        let path = cacheDir().appendingPathComponent("\(key).json")
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        return try? JSONDecoder().decode([Gallery].self, from: data)
+    }
+
+    func loadNextPage() async {
+        guard hasMore, !isLoading else { return }
+        currentPage += 1
+        await loadGalleries(reset: false)
+    }
+
+    func search() async {
+        // 既存の検索 in-flight があれば cancel (Enter 連打 / 連続検索の race 防止)。
+        searchTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.loadGalleries(reset: true)
+        }
+        searchTask = task
+        await task.value
+    }
+
+    func refresh() async {
+        // 田中報告 2026-05-30: プルダウン更新で新着が出ない件。.refreshable のタスクは
+        // プルダウン戻り中の再描画 (onScrollUp/Down の tabBarHidden トグル等) でキャンセルされ得る。
+        // 直呼びだと loadGalleries 内の `if Task.isCancelled { return }` で取得結果を反映する前に抜け、
+        // ハプティックだけ出て更新されない。search() と同じく独立 Task で包み生存させる。
+        let task = Task { [weak self] in
+            await self?.loadGalleries(reset: true)
+        }
+        await task.value
+    }
+
+    private func buildQuery() -> String? {
+        var parts: [String] = []
+        if let base = baseQuery, !base.isEmpty {
+            parts.append(base)
+        }
+        if !searchText.isEmpty {
+            parts.append(searchText)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
+    /// タグ辞書翻訳付き検索クエリを構築
+    func buildQueryWithTagTranslation() -> String? {
+        var parts: [String] = []
+        if let base = baseQuery, !base.isEmpty {
+            parts.append(base)
+        }
+        if !searchText.isEmpty {
+            parts.append(TagTranslator.translate(searchText))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+}

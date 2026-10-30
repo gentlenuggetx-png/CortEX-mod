@@ -1,0 +1,251 @@
+# Cort:EX ver.02a f12
+
+**E-Hentai / EXhentai / nhentai 统一浏览器 for iOS / iPadOS**
+
+[English](README.md) | [中文](README_zh.md) | [日本語](README_ja.md)
+
+---
+
+## 演示
+
+https://github.com/CielDevApp/CortEX/raw/main/assets/demo.mp4
+
+> *内容已模糊处理*
+
+---
+
+## 功能
+
+### 多站点整合
+- **E-Hentai / EXhentai** — 根据登录状态自动切换。未登录也可浏览E-Hentai
+- **nhentai** — 完整API集成、Cloudflare自动绕过（WKWebView cf_clearance）、WebP支持
+- **四层删除作品恢复** — nhentai（应用内搜索）→ nyahentai.one → hitomi.la → 标题复制
+
+### 阅读器
+- **4种模式** — 垂直滚动 / 水平翻页 / iPad双页展开 / 捏合缩放
+- **iPad双页** — 自动横屏检测、双页合成渲染（零间隙）、宽图独立显示
+- **从右到左 / 从左到右** — 支持边缘点击翻页
+- **双击缩放** — 支持Live Text（文字选择）
+
+### 图像处理（3引擎）
+- **CIFilter** — 色调曲线、锐化、降噪
+- **Metal Compute Shader** — GPU直接管线
+- **CoreML Real-ESRGAN** — Neural Engine 4倍超分辨率（分块处理）
+- **4级画质** — 低画质 → 低画质+超分 → 标准 → 标准+滤镜
+- **HDR增强** — 暗部细节恢复 + 自然饱和度 + 对比度
+
+### 下载
+- **双向下载（极限钳形攻势）** — 前向+后向同时下载
+- **二次扫描** — 失败页面自动重试（指数退避）
+- **Live Activity** — 锁屏 + 灵动岛进度显示
+- **阅读/下载分离** — 关闭时提示"是否下载剩余页面？"
+
+### 收藏
+- **双缓存** — E-Hentai / nhentai 独立缓存（磁盘持久化）
+- **nhentai同步** — WKWebView SPA渲染 → JavaScript ID提取 → API解析
+- **搜索 / 排序** — 添加日期（最新/最旧）/ 标题
+
+### nhentai详情页
+- 标题 / 封面 / 信息（语言、页数、社团、画师、同人原作）
+- **标签点击搜索** — 一键搜索 artist:名称、group:名称 等
+- 缩略图网格 → 点击跳转到指定页面
+- 滤镜管线（降噪 / 增强 / HDR）
+
+### 安全
+- **Face ID / Touch ID** — 启动和恢复时认证
+- **4位PIN码** — 生物识别失败后备
+- **应用切换模糊** — 任务切换器中隐藏内容
+- **Keychain加密** — Cookie和凭证安全存储
+
+### 备份
+- **PHOENIX MODE** — E-Hentai + nhentai 统一JSON收藏备份
+- **极限安全锁** — 必须先备份才能启用EXTREME MODE
+- **.cortex导出** — 画廊ZIP包
+
+### 性能
+- **ECO模式** — NPU/GPU禁用、30Hz、iOS低电量模式联动
+- **EXTREME MODE** — 全部限制器解除（20并行、零延迟）
+- **CDN回退** — i/i1/i2/i3自动切换 + 扩展名回退（webp→jpg→png）
+
+### 翻译
+- **Vision OCR** → Apple Translation API → 图像烧录
+- 5种语言（日/英/中/韩/自动）
+
+### AI（iOS 26+）
+- **Foundation Models** — 自动分类、标签推荐
+
+### UI/UX
+- **TipKit（11条提示）** — 所有功能的操作提示，可在设置中重新显示
+- **8种语言** — 日 / 英 / 简中 / 繁中 / 韩 / 德 / 法 / 西
+- **动态标签** — 根据登录状态自动切换 E-Hentai ↔ EXhentai
+- **基准测试** — CIFilter vs Metal 速度测试 + 设备型号显示
+- **锁屏壁纸** — 收藏的画廊封面自动显示为锁屏背景
+- **标签栏自动隐藏** — 向下滚动时隐藏标签栏，增加显示空间
+
+---
+
+## 架构
+
+iPhone / iPad / Mac 通用单代码库。基于 Apple 原生 20 个框架构建，零外部依赖。
+
+**9 层架构:**
+
+| # | 层 | 主要构成 |
+|---|---|---|
+| 01 | PRESENTATION | 4 模式阅读器（垂直滚动 / 水平翻页 / iPad 双页展开 / 捏合缩放） |
+| 02 | MODES | SAFETY (default) / EXTREME / ECO / SPARE 四种运行模式 |
+| 03 | INGESTION | E-Hentai / EXhentai 动态切换、nhentai v2 API + Cloudflare Turnstile 突破 |
+| 04 | TRANSPORT | BackgroundDownloadManager、URLSession 后台下载、BAN 封堵 6 路径、2ndpass 并行 5 |
+| 05 | COMPUTE | 图像处理引擎 3 基（CIFilter / Metal Compute / CoreML Real-ESRGAN） |
+| 06 | MEDIA | 动画 WebP / HEVC 转换、HDR 校正、VideoToolbox 硬件编码 |
+| 07 | SILICON | CPU / GPU (Metal) / NPU (CoreML) / Media Engine 全活用，iPhone A17 Pro / iPad A17 Pro / Mac M1–M4 支持 |
+| 08 | TRUST | Face ID / Touch ID / PIN / Keychain / App Switcher 模糊 |
+| 09 | PLATFORM | iOS 18+ / iPadOS 18+ / macOS 14+ Mac Catalyst、8 语言本地化 |
+
+**SAFETY MODE 主要特性:**
+- BAN 检测 6 路径完全封堵
+- 50 页 / 60 秒 自动 cooldown
+- 2ndpass 并行 5 自动救回失败页面
+- 维持并行度，速度无牺牲
+- disk prefix skip · reconcileGallery
+
+**构成事实:**
+- 91 个 Swift 文件 / 约 20,000 行
+- 外部依赖库: 0
+- Apple 原生框架: 20
+- 支持: iOS 18+ / iPadOS 18+ / macOS 14+
+
+---
+
+## 系统要求
+- iOS 18.0+ / iPadOS 18.0+（iOS 26 / iPadOS 26 已测试）
+- macOS 14.0+（Mac Catalyst，Apple Silicon / Intel 均可）
+- iPhone / iPad（支持iPad双页模式）/ Mac
+
+## 安装
+
+### iOS / iPadOS — 从源码构建
+1. 克隆：`git clone https://github.com/CielDevApp/CortEX.git`
+2. 用 Xcode 16+ 打开 `EhViewer.xcodeproj`
+3. 在 Signing & Capabilities 中选择你的Team
+4. 将 Bundle Identifier 改为唯一值（如 `com.yourname.cortex`）
+5. 连接设备，点击 Run
+
+### iOS / iPadOS — 免电脑安装
+1. 从 [Releases](https://github.com/CielDevApp/CortEX/releases/latest) 下载 `EhViewer-<version>.ipa`
+2. 通过 AltStore、Sideloadly 或 TrollStore 安装
+   - AltStore / Sideloadly 导入时会用你自己的 Personal Team 重新签名，因此分发 IPA 的签名会被剥离（只要是最新版 IPA 即可）
+   - TrollStore 无需重新签名，直接使用
+
+> 注意：免费Apple开发者账号侧载签名有7天限制。建议使用AltStore自动续签。
+
+### Mac（Catalyst版） — 下载预编译 .app
+1. 从 [Releases](https://github.com/CielDevApp/CortEX/releases/latest) 下载 `EhViewer-macOS-<version>.zip`（Developer ID 签名 + Apple 公证）
+2. 解压后将 `EhViewer.app` 拖入 `/Applications`
+3. 双击启动 — 无需 `xattr` 绕过，Gatekeeper 直接通过
+
+### Mac（Catalyst版） — 从源码构建
+1. 克隆：`git clone https://github.com/CielDevApp/CortEX.git`
+2. 用 Xcode 16+ 打开 `EhViewer.xcodeproj`
+3. Scheme = `EhViewer`，Destination = `My Mac (Mac Catalyst)`
+4. 在 Signing & Capabilities 中选择你的Team，并修改 Bundle Identifier
+5. Product → Run 启动，或 Product → Archive 导出 `.app` 后拖入 `/Applications`
+   - 命令行：`xcodebuild -project EhViewer.xcodeproj -scheme EhViewer -destination 'platform=macOS,variant=Mac Catalyst' build`
+6. Mac 版顶部配备独立 7 标签栏（画廊 / 收藏 / 抽卡 / 已保存 / 历史 / 角色管理 / 设置），无论窗口宽度始终横向排列
+
+## 技术栈
+- Swift / SwiftUI
+- 92 个 Swift 文件 / 约 20,000 行代码
+- Metal / CoreML / Vision / WebKit / ActivityKit / TipKit
+
+## 更新日志
+
+### ver.02a f12 (2026-05-16)
+- **抽卡的作品详情 → 标签搜索结果 → 作品点击无反应 修复** — GachaView 的 NavigationStack 缺少 `NavigationPathBox` 绑定与 `.environment(\.navPathBox)` 注入，导致 TagSearchResultView 内的作品点击为 no-op。DownloadsView / FavoritesView / GalleryListView 已采用相同模式修复 (commit 91760d5 等)，抽卡是漏修，现按同模式补齐
+- **搜索历史点击无反应 修复** — GalleryListView 的 `advancedSearchOverlay` 在 AdvancedSearchView 外侧的 `.contentShape(Rectangle()) + .onTapGesture { /* 内侧点击不关闭 */ }` 在 SwiftUI iOS 18.7 上吸收了内部 Form 内 Button (过去检索 row) 的所有 tap。撤掉后解决
+
+### ver.02a f11.1 (2026-05-02)
+- **NavigationPath 残留修复** — 打开作品 A 关闭后、再打开作品 B 并返回时显示 **A 的详情** (iPhone / iPad)。列表直接 push 时改为先用 `navPath = NavigationPath()` 重置再 append。标签搜索的链式导航仍保留历史
+- **混合作品的静态页显示 ▶ 图标 (复发) 修复** — Reader 内部 DL 路径从 gallery-level scan flag 改为 per-page 实际文件判定 (与 external_zip 行为统一)
+- **iPad 见开页预读 ±5 → ±15** — 1 屏 = 2 页，之前 ±5 只能预读 2.5 屏，常出现等待。左右翻向均匀 +10
+- **见开页返回点击不对称修复** — 前进 = 2 页但后退 = 1 页，通过修正 `prevSpreadIndex` 后退也对齐为 2 页
+- **库界面新增 grid/list 切换** — 与画廊列表同列数 (iPad=4 / iPhone=3 / Mac Catalyst=adaptive)
+- **搜索画面 23 个 UI 字符串本地化为 7 种语言** — en/de/es/fr/ko/zh-Hans/zh-Hant
+
+### ver.02a f11 (2026-05-01)
+- **搜索更易用 (iOS)** — 移除顶部的 `.searchable` 搜索栏 (默认带有偏向日语的排除查询)，改为通过导航栏右上角放大镜按钮打开专用搜索画面。可任意选择分类与语言组合，All / Doujinshi / Tankoubon 分段标签也一并撤除，改为完全由用户驱动的筛选。搜索画面下方按主机 (E-Hentai / ExHentai / nhentai) 分别显示历史搜索记录，一键即可重新执行。nhentai 模式仅显示实际存在的分类，语言通过 namespace 查询正确组装。Mac Catalyst 界面保持不变。
+
+### ver.02a f10 (2026-04-28)
+- **WKWebView E-Hentai / EXhentai 浏览器登录** — 在现有登录画面添加「通过浏览器登录」按钮 (全平台)。Safari 风格 toolbar + WKWebView 模态自动提取 3 个 cookie (`ipb_member_id` / `ipb_pass_hash` / `igneous`) 并自动填入认证信息字段。针对 E-Hentai 会话传播延迟的对策: 到达 forums.e-hentai.org 时整个模态 dismiss → 0.5 秒等待 → sheet 重新 present，物理模拟「关闭后重开」操作，第 2 次确实触发 `igneous` 发行。包含 `…` 菜单的「清除 e-hentai/exhentai cookie」debug 功能 (nhentai cookie 不受影响)。Cort:EX 黑/橙配色 + SF Symbols 统一。
+
+### ver.02a f9 (2026-04-27)
+- **库排序菜单**（全平台）— 「已保存」分区添加追加日 / 名称升降序排序菜单。@AppStorage 持久化，与外部参考分区独立操作
+- **`.cortex` 追加日修复** — 不含 metadata.json 的 `.cortex` ZIP 在每次扫描时被 `Date()` 填充为「现在」，导致 Unrealbeauty Yaoguang / UnityNay 等永远位于最上方。改为使用 ZIP 文件的 creationDate（fallback mtime），与子文件夹形式行为统一
+
+### ver.02a f8 (2026-04-27)
+- **画廊网格视图**（iPad / iPhone / Mac Catalyst 全平台）+ List/Grid 切换 — iPhone 3 列固定、iPad 4 列固定、Mac Catalyst adaptive(180+)。EH/EXH 全标签 + nhentai 全排序适用
+- **画廊搜索 race fix** — Enter 连击 / 连续搜索的 cancellation 处理修复
+- **nhentai 人气排序复活** — 切换到 v2 search endpoint
+- **网格全屏空白对策** — 统合 dummy slot 机构
+- **DL 后 SSD → NAS 转送对话框 + 进度条**
+- **抽卡 10 连演出**的缩略图重叠减少
+- **库详情 sheet → 标签搜索 → 作品点击**的导航修复
+- **静画跳页 freeze 解消**、sandbox-off path-override、ImageCache race 修复
+- **Removed:** iPhone 共享按钮 → Mac Cort:EX 委托下载 (cortex://download/queue) 已移除（实装未达 + 必要性消失）。已保存导出 (.cortex zip 共享) 不变
+
+### ver.02a f6 (2026-04-23)
+- **Mac Catalyst 完全支持** — 支持 macOS 14+（Apple Silicon / Intel）的通用构建。Developer ID 签名 + Apple 公证的 `.app` 通过 GitHub Releases 分发，拖入 `/Applications` 双击即可启动。顶部标签栏用自定义 HStack 重写（绕开 Catalyst TabView 的 overflow menu），全 7 标签始终横排 + 整格命中区 + 方向键翻页
+- **EXTREME MODE → SAFETY MODE 重设计** — 以 BAN 抗性为核心重新组织结构。BAN 检测 6 路径完全封堵、50 页 / 60 秒 自动 cooldown、并行度保持不降速的 class-change。transport 层整合 509 gif URL 模式检测、Cloudflare `cf-mitigated` 头检测、HTML fallback 检测、home.php 误重定向检测
+- **动画 WebP 阅读器强化** — 统一手动播放模式（▶ 图标点击触发转换），HDR 校正合并到现有图像设置，长按菜单直接切换模式。检测统一使用 VP8X magic，原始字节从内存转移到磁盘 URL 路径以降低内存压力
+- **动画 WebP 卡顿修复** — 修复 LocalReader / GalleryReader 自动播放导致的内存爆炸与 UI 卡死。AVPlayer 仅当前页升级、缓存升级移至 init、PlayerContainerView 不再吞掉滚动手势、缓存复活时的重建循环彻底解决
+- **nhentai 登录恢复 (Mac Catalyst)** — 用文件回退方式 (`~/Documents/EhViewer/creds/`) 绕开 Keychain `-34018 errSecMissingEntitlement`，同时修复 Cloudflare 通过路径，Catalyst 下也能持久认证
+- **iPad 标签栏跟随** — 改用 GeometryReader + PreferenceKey 观测路径，iPad 上向下滚动时的标签栏自动隐藏也能稳定工作
+- **已下载封面本地复用扩展** — 不仅在详情页，现在在历史 / 抽卡 / 设置页也优先使用本地封面图像，减少 CDN 往返
+- **发布自动化** — 新增 `scripts/release-mac.sh`（Archive → Developer ID 签名 → notarize → staple → zip）和 `scripts/release-ios.sh`（Archive → Development IPA 导出），一个 tag 参数同时生成 Mac zip + iOS IPA
+
+### ver.02a f5 (2026-04-20)
+- **自研 ZIP streaming writer** — 替换 Apple 的 NSFileCoordinator.forUploading（大作品 59 秒主线程阻塞 + Code=512 失败），改为流式 stored+ZIP64 writer。6 倍速 + 实时进度条 + 3GB+ 作品也能正常导出
+- **僵尸下载根除** — 删除 / 取消后 URL 解析 / stream 消费 / 二次重试循环仍在运行的问题修复。清理时的元数据复活也已防止
+- **滚动位置一致性** — LocalReaderView 页码与显示页不一致的问题根除。LazyVStack `.onAppear` 的 last-wins 竞态 + `.scrollPosition` / `scrollTo` API 冲突导致「1/47 却在显示第 13 页」类错位
+- **已保存作品预览** — 长按显示全页缩略图网格，点击跳转该页阅读。竖长固定单元格统一布局，动画 WebP 以紫框 + ▶ 图标标识
+- **0B 缓存误识别防护** — `isFullyConverted` 增加尺寸检查（≥10KB），避免 race condition 导致的 0B 缓存 mp4 引发 AVPlayer "item failed" 连锁
+- **DL 重试策略** — Cloudflare `cf-mitigated: challenge` 头检测、509 gif URL 模式检测、SpeedTracker 基于字节进度的看门狗、别镜像重试中 UI 阶段
+- **并行下载** — URL 解析完成即释放 semaphore，支持多作品并行下载
+- **临时文件自动清理** — 共享表单完成时（AirDrop / Save to Files / 取消）即删除 `.cortex`，与启动时残骸清理协同
+
+### ver.02a f3 (2026-04-12)
+- **GPU精灵图管线** — 精灵图解码、裁剪、缩放通过Metal CIContext单通道GPU渲染
+- **专用图像处理队列** — 所有精灵图处理移至独立DispatchQueue，消除协作线程池饥饿
+- **磁盘缓存废除** — 移除精灵图和裁剪缩略图的JPEG重编码（仅内存缓存，可重新获取）
+- **启动预取优化** — 缩略图预取从全部收藏（2400+）缩减至可见的30项
+
+### ver.02a f2 (2026-04-07)
+- **收藏切换可靠性** — 429错误页面重试+退避、禁用按钮检测、Cookie去重修复
+- **Cookie管理改进** — 改为保留服务器设置属性（HttpOnly, Secure）的补充注入方式
+- **速率限制加固** — `fetch()` 新增429重试（3秒/6秒指数退避，最多3次）
+
+### ver.02a f1 (2026-04-05)
+- **nhentai API v2迁移** — 从v1全面迁移至v2 API，通过WKWebView绕过Cloudflare TLS指纹检测
+- **nhentai收藏切换** — 通过SPA `#favorite` 按钮点击实现服务端添加/移除（SvelteKit hydration轮询）
+- **收藏同步优化** — 跳过已缓存画廊大幅减少API调用，429重试+指数退避
+- **v2认证支持** — `isLoggedIn()` 现在也识别 `access_token`（v2），不再仅依赖旧版 `sessionid`
+- **缩略图 / 封面 v2** — 使用v2 API的 `thumbnailPath` 和 `path`，CDN回退（i/i1/i2/i3）
+- **已删除作品恢复** — 打开阅读器前通过 `fetchGallery` 获取完整详情
+- **nhentai详情页** — 标签点击搜索、缩略图网格、下载、滤镜管线
+- **锁屏壁纸** — 收藏封面自动显示为模糊锁屏背景
+- **标签栏自动隐藏** — 向下滚动时隐藏标签栏，增加显示空间
+
+### ver.02a（首次发布）
+- E-Hentai / EXhentai / nhentai 统一浏览器
+- 4模式阅读器（支持iPad双页展开）
+- 3引擎图像处理（CIFilter / Metal / CoreML Real-ESRGAN）
+- 双向下载 + Live Activity
+- Face ID / Touch ID / PIN安全
+- PHOENIX MODE备份、ECO / EXTREME性能模式
+- Vision OCR翻译、TipKit提示、8语言本地化
+
+## 许可证
+本项目采用 GPL-3.0 许可证 - 详见 [LICENSE](LICENSE) 文件。
+
+## 支持
+在 [Patreon](https://www.patreon.com/c/Cielchan) 上支持开发。

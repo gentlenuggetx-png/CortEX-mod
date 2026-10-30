@@ -1,0 +1,225 @@
+import SwiftUI
+
+struct HistoryView: View {
+    @ObservedObject private var history = HistoryManager.shared
+    @State private var showClearConfirm = false
+    // 他タブ(Favorites/Downloads/Gacha/GalleryList)と同じ navPathBox 方式に統一。
+    // これが無いと履歴→詳細→タグ→検索結果 の TagSearchResultView で navPathBox=nil となり
+    // 作品タップが no-op になる (2026-05-16 ガチャ経路と同型の NavigationPathBox 漏れ)。
+    @StateObject private var navPathBox = NavigationPathBox()
+    @State private var previewEhGallery: Gallery?
+    @State private var previewNhGallery: NhentaiClient.NhGallery?
+    @State private var previewEhReader: GalleryPreviewReaderRequest?
+    @State private var previewNhReader: NhentaiPreviewReaderRequest?
+
+    var body: some View {
+        NavigationStack(path: $navPathBox.path) {
+            List {
+                if history.isEmpty {
+                    ContentUnavailableView {
+                        Label("閲覧履歴がありません", systemImage: "clock.arrow.circlepath")
+                    } description: {
+                        Text("ギャラリーを読むと履歴に記録されます")
+                    }
+                }
+
+                ForEach(history.mergedItems) { item in
+                    switch item {
+                    case .eh(let entry):
+                        let g = history.toGallery(entry)
+                        // UI 刷新 Phase 1.9 (2026-07-03): カード化 (一覧と同型)
+                        CardDesign.cardChrome(ehHistoryRow(entry: entry))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .contentShape(Rectangle())
+                            .onTapGesture { navPathBox.path.append(g) }
+                            .onLongPressGesture(minimumDuration: 0.4, maximumDistance: 15) {
+                                #if canImport(UIKit)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                #endif
+                                previewEhGallery = g
+                            }
+                    case .nh(let entry):
+                        CardDesign.cardChrome(nhHistoryRow(entry: entry))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .contentShape(Rectangle())
+                            .onTapGesture { navPathBox.path.append(entry.gallery) }
+                            .onLongPressGesture(minimumDuration: 0.4, maximumDistance: 15) {
+                                #if canImport(UIKit)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                #endif
+                                previewNhGallery = entry.gallery
+                            }
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(CardDesign.listBackground.ignoresSafeArea())
+            .navigationTitle("履歴")
+            .toolbar {
+                if !history.isEmpty {
+                    ToolbarItem(placement: .automatic) {
+                        Button(role: .destructive) {
+                            showClearConfirm = true
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                    }
+                }
+            }
+            .alert("全履歴を削除", isPresented: $showClearConfirm) {
+                Button("削除", role: .destructive) {
+                    history.clearAll()
+                }
+                Button("キャンセル", role: .cancel) {}
+            } message: {
+                Text("閲覧履歴をすべて削除します。この操作は取り消せません。")
+            }
+            .navigationDestination(for: Gallery.self) { gallery in
+                GalleryDetailView(gallery: gallery, host: .exhentai)
+            }
+            .navigationDestination(for: NhentaiClient.NhGallery.self) { nh in
+                NhentaiDetailView(gallery: nh)
+            }
+            .navigationDestination(for: CategoryFilter.self) { filter in
+                TagSearchResultView(searchQuery: filter.query, host: .exhentai, title: filter.displayTitle)
+            }
+            .navigationDestination(for: TagSearch.self) { search in
+                TagSearchResultView(searchQuery: search.query, host: .exhentai, title: search.displayTitle)
+            }
+            .navigationDestination(for: UploaderSearch.self) { search in
+                TagSearchResultView(searchQuery: search.query, host: .exhentai, title: search.displayTitle)
+            }
+            .overlay {
+                if let g = previewEhGallery {
+                    GalleryPreviewOverlay(
+                        gallery: g,
+                        host: .exhentai,
+                        onDismiss: { previewEhGallery = nil },
+                        onTapPage: { thumbnails, page in
+                            previewEhReader = GalleryPreviewReaderRequest(gallery: g, page: page, thumbnails: thumbnails)
+                        }
+                    )
+                }
+                if let nh = previewNhGallery {
+                    NhentaiPreviewOverlay(
+                        gallery: nh,
+                        onDismiss: { previewNhGallery = nil },
+                        onTapPage: { loadedGallery, page in
+                            previewNhReader = NhentaiPreviewReaderRequest(gallery: loadedGallery, page: page)
+                        }
+                    )
+                }
+            }
+            #if os(iOS)
+            .fullScreenCover(item: $previewEhReader) { req in
+                GalleryReaderView(gallery: req.gallery, host: .exhentai, initialPage: req.page, thumbnails: req.thumbnails, route: .onlineHistory)
+                    .onAppear {
+                        HistoryManager.shared.record(gallery: req.gallery, page: req.page)
+                        previewEhGallery = nil
+                    }
+            }
+            .fullScreenCover(item: $previewNhReader) { req in
+                NhentaiReaderView(gallery: req.gallery, initialPage: req.page, route: .nhHistory)
+                    .onAppear {
+                        HistoryManager.shared.recordNhentai(gallery: req.gallery, page: req.page)
+                        previewNhGallery = nil
+                    }
+            }
+            #endif
+            .environment(\.navPathBox, navPathBox)
+        }
+    }
+
+    @ViewBuilder
+    private func ehHistoryRow(entry: HistoryEntry) -> some View {
+        HStack(spacing: 12) {
+            CachedImageView(url: entry.coverURL, host: .exhentai, gid: entry.gid)
+                .frame(width: 80, height: 110)
+                .clipShape(RoundedRectangle(cornerRadius: CardDesign.coverCorner, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: CardDesign.coverCorner, style: .continuous)
+                        .fill(Color.gray.opacity(0.15))
+                )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.title)
+                    .font(.callout)
+                    .fontWeight(.semibold)
+                    .lineLimit(2)
+
+                Spacer()
+
+                if let catName = entry.category, let cat = GalleryCategory(rawValue: catName) {
+                    TintedBadge(text: cat.rawValue, color: Color(hex: cat.color))
+                }
+
+                HStack {
+                    if entry.lastReadPage > 0 {
+                        Label("\(entry.lastReadPage + 1)/\(entry.pageCount)P", systemImage: "bookmark.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    } else if entry.pageCount > 0 {
+                        Label("\(entry.pageCount)P", systemImage: "doc")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Text(entry.viewedDate, style: .relative)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                + Text(" 前")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func nhHistoryRow(entry: NhHistoryEntry) -> some View {
+        HStack(spacing: 12) {
+            // NhentaiCardViewと同じcache優先 + v2 path対応
+            NhentaiCoverView(gallery: entry.gallery)
+                .frame(width: 80, height: 110)
+                .clipShape(RoundedRectangle(cornerRadius: CardDesign.coverCorner, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.gallery.displayTitle)
+                    .font(.callout)
+                    .fontWeight(.semibold)
+                    .lineLimit(2)
+
+                Spacer()
+
+                // nhentaiバッジ
+                TintedBadge(text: "NH", color: .orange)
+
+                HStack {
+                    if entry.lastReadPage > 0 {
+                        Label("\(entry.lastReadPage + 1)/\(entry.gallery.num_pages)P", systemImage: "bookmark.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    } else if entry.gallery.num_pages > 0 {
+                        Label("\(entry.gallery.num_pages)P", systemImage: "doc")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Text(entry.viewedDate, style: .relative)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                + Text(" 前")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}

@@ -1,0 +1,858 @@
+import SwiftUI
+import Combine
+
+/// nhentaiギャラリー詳細画面（E-HentaiのGalleryDetailViewと同等）
+struct NhentaiDetailView: View {
+    let initialGallery: NhentaiClient.NhGallery
+    @StateObject private var detail = NhDetailLoader()
+
+    @ObservedObject private var downloadManager = DownloadManager.shared
+    @State private var coverImage: PlatformImage?
+    @State private var readerRequest: NhReaderRequest?
+    @State private var isFavorited: Bool
+    @State private var cortexSearchURL: URL?
+    @State private var showFavFailedAlert = false
+    @State private var favFailedGalleryId: Int = 0
+
+    private var gallery: NhentaiClient.NhGallery { detail.gallery ?? initialGallery }
+
+    init(gallery: NhentaiClient.NhGallery) {
+        self.initialGallery = gallery
+        self._isFavorited = State(initialValue: NhentaiFavoritesCache.shared.contains(id: gallery.id))
+    }
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 4),
+        GridItem(.flexible(), spacing: 4),
+        GridItem(.flexible(), spacing: 4),
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                headerSection
+                infoSection
+                if let tags = gallery.tags, !tags.isEmpty {
+                    tagsSection(tags)
+                }
+                actionButtons
+                thumbnailGrid
+            }
+            .padding()
+        }
+        .navigationTitle(gallery.displayTitle)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(item: $readerRequest) { req in
+            NhentaiReaderView(gallery: gallery, initialPage: req.page, route: .nhDetail)
+        }
+        #endif
+        .navigationDestination(for: NhTagSearch.self) { search in
+            NhTagSearchResultView(search: search)
+        }
+        .id(initialGallery.id)
+        .sheet(item: $cortexSearchURL) { url in
+            InAppBrowserView(url: url)
+        }
+        .alert("サーバー反映に失敗しました", isPresented: $showFavFailedAlert) {
+            Button("Safari で完了") {
+                #if canImport(UIKit)
+                if let url = URL(string: "https://nhentai.net/g/\(favFailedGalleryId)/") {
+                    UIApplication.shared.open(url)
+                }
+                #endif
+            }
+            Button("設定で再認証") {
+                NotificationCenter.default.post(name: .navigateToSettingsTab, object: nil)
+            }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text("ローカルには追加済みです。Safari で手動完了するか、設定から nhentai に再認証してください。")
+        }
+        // UI 刷新 Phase 2 (2026-07-03): 全 GroupBox をカード化 + グループ背景 (表層のみ)
+        .groupBoxStyle(CardGroupBoxStyle())
+        .background(CardDesign.listBackground.ignoresSafeArea())
+        .task {
+            // 詳細画面を開いた時点で既読確定 (田中要望 2026-07-02、リーダー起動から前倒し)
+            ReadHistoryStore.shared.markAsRead(site: .nh, gid: initialGallery.id)
+            await loadFullDetail()
+            await loadCover()
+        }
+    }
+
+    // MARK: - Header
+
+    private var headerSection: some View {
+        HStack(alignment: .top, spacing: 12) {
+            // カバー画像
+            Group {
+                if let img = coverImage {
+                    Image(platformImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.gray.opacity(0.2))
+                        .overlay { ProgressView() }
+                }
+            }
+            .frame(width: 120, height: 170)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 6) {
+                // タイトル
+                if let jp = gallery.title.japanese {
+                    Text(jp)
+                        .font(.subheadline.bold())
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                if let en = gallery.title.english, en != gallery.title.japanese {
+                    Text(en)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                }
+
+                Spacer()
+
+                // お気に入りボタン
+                // ファボ追加: ローカル即時追加 + 裏サーバー試行 → 失敗時 Safari 誘導
+                // ファボ削除: CF 鉄壁のため問答無用で Safari 誘導（ローカルは即時削除）
+                if NhentaiCookieManager.isLoggedIn() {
+                    Button {
+                        let gid = gallery.id
+                        if isFavorited {
+                            // アンファボ: ローカル即時削除 → Safari
+                            isFavorited = false
+                            NhentaiFavoritesCache.shared.removeFromCache(id: gid)
+                            #if canImport(UIKit)
+                            if let url = URL(string: "https://nhentai.net/g/\(gid)/") {
+                                UIApplication.shared.open(url)
+                                LogManager.shared.log("nhentai", "unfavorite gid=\(gid) → local removed + Safari")
+                            }
+                            #endif
+                        } else {
+                            // ファボ追加: ローカル即時追加 → 裏サーバー試行
+                            isFavorited = true
+                            let capturedGallery = gallery
+                            NhentaiFavoritesCache.shared.addToCache(capturedGallery)
+                            Task {
+                                let result = (try? await NhentaiClient.toggleFavorite(galleryId: gid)) ?? false
+                                if result {
+                                    LogManager.shared.log("nhentai", "favorite gid=\(gid) (server confirmed)")
+                                } else {
+                                    // サーバー失敗 → UI は維持、確認 alert を出す
+                                    LogManager.shared.log("nhentai", "favorite gid=\(gid) server failed → showing alert")
+                                    await MainActor.run {
+                                        favFailedGalleryId = gid
+                                        showFavFailedAlert = true
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(
+                            isFavorited ? "お気に入り済み" : "お気に入り",
+                            systemImage: isFavorited ? "heart.fill" : "heart"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(isFavorited ? .red : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Info
+
+    private var infoSection: some View {
+        GroupBox("情報") {
+            VStack(spacing: 8) {
+                // 言語
+                let languages = gallery.tags?.filter { $0.type == "language" }.map(\.name) ?? []
+                if !languages.isEmpty {
+                    infoRow("言語", value: languages.joined(separator: ", "))
+                }
+
+                infoRow("ページ数", value: "\(gallery.num_pages)")
+
+                // サークル
+                let groups = gallery.tags?.filter { $0.type == "group" }.map(\.name) ?? []
+                if !groups.isEmpty {
+                    infoRow("サークル", value: groups.joined(separator: ", "))
+                }
+
+                // 作家
+                let artists = gallery.tags?.filter { $0.type == "artist" }.map(\.name) ?? []
+                if !artists.isEmpty {
+                    infoRow("作家", value: artists.joined(separator: ", "))
+                }
+
+                // パロディ
+                let parodies = gallery.tags?.filter { $0.type == "parody" }.map(\.name) ?? []
+                if !parodies.isEmpty {
+                    infoRow("パロディ", value: parodies.joined(separator: ", "))
+                }
+
+                // カテゴリ
+                let categories = gallery.tags?.filter { $0.type == "category" }.map(\.name) ?? []
+                if !categories.isEmpty {
+                    infoRow("カテゴリ", value: categories.joined(separator: ", "))
+                }
+
+                infoRow("ID", value: "\(gallery.id)")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func infoRow(_ label: String, value: String) -> some View {
+        HStack {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).font(.caption)
+        }
+    }
+
+    // MARK: - Tags
+
+    @AppStorage(UDKey.cortexProtocolUnlocked) private var cortexUnlocked = false
+
+    private func cortexAge(for characterName: String) -> Int? {
+        guard let ages = UserDefaults.standard.dictionary(forKey: UDKey.cortexCharacterAges) as? [String: Int] else { return nil }
+        if let age = ages[characterName] { return age }
+        for (name, age) in ages {
+            if name.localizedCaseInsensitiveCompare(characterName) == .orderedSame { return age }
+            if characterName.localizedCaseInsensitiveContains(name) || name.localizedCaseInsensitiveContains(characterName) { return age }
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private func tagsSection(_ tags: [NhentaiClient.NhTag]) -> some View {
+        let grouped = Dictionary(grouping: tags, by: \.type)
+
+        GroupBox("タグ") {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(grouped.keys.sorted()), id: \.self) { type in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(type)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.secondary)
+
+                        FlowLayout(spacing: 4) {
+                            ForEach(grouped[type] ?? [], id: \.id) { tag in
+                                HStack(spacing: 2) {
+                                    NavigationLink(value: NhTagSearch(type: type, name: tag.name)) {
+                                        Text(tag.name)
+                                            .font(.caption2)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 3)
+                                            .background(tagColor(for: type).opacity(0.12), in: Capsule())
+                                            .foregroundStyle(tagColor(for: type))
+                                    }
+
+                                    if cortexUnlocked && type == "character" {
+                                        if let age = cortexAge(for: tag.name) {
+                                            Text("\(age)")
+                                                .font(.system(size: 9).monospaced().bold())
+                                                .padding(.horizontal, 4)
+                                                .padding(.vertical, 1)
+                                                .background(Color.green.opacity(0.2))
+                                                .foregroundStyle(.green)
+                                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                                        }
+                                        Button {
+                                            let query = "\(tag.name) Animecharacter Age".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tag.name
+                                            if let url = URL(string: "https://www.google.com/search?q=\(query)") {
+                                                cortexSearchURL = url
+                                            }
+                                        } label: {
+                                            Image(systemName: "magnifyingglass")
+                                                .font(.system(size: 9))
+                                                .padding(3)
+                                                .background(Color.cyan.opacity(0.15))
+                                                .foregroundStyle(.cyan)
+                                                .clipShape(Circle())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func tagColor(for type: String) -> Color {
+        switch type {
+        case "artist": return .purple
+        case "group": return .orange
+        case "parody": return .green
+        case "character": return .pink
+        case "tag": return .blue
+        case "language": return .teal
+        case "category": return .brown
+        default: return .gray
+        }
+    }
+
+    // MARK: - Action Buttons
+
+    private var actionButtons: some View {
+        VStack(spacing: 8) {
+            // 最初から読む
+            Button {
+                HistoryManager.shared.recordNhentai(gallery: gallery, page: 0)
+                readerRequest = NhReaderRequest(page: 0)
+            } label: {
+                Label("最初から読む", systemImage: "book.fill")
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(.blue.gradient, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .foregroundStyle(.white)
+                    .bold()
+            }
+
+            // ダウンロード
+            nhDownloadButton
+        }
+    }
+
+    @ViewBuilder
+    private var nhDownloadButton: some View {
+        let gid = -gallery.id
+
+        if downloadManager.isDownloaded(gid: gid) {
+            Label("ダウンロード済み", systemImage: "checkmark.circle.fill")
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(.green.opacity(0.15), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .foregroundStyle(.green)
+        } else if let progress = downloadManager.activeDownloads[gid] {
+            VStack(spacing: 6) {
+                HStack {
+                    Text("ダウンロード中 \(progress.current)/\(progress.total)")
+                        .font(.subheadline).bold()
+                    Spacer()
+                    Button("キャンセル") {
+                        downloadManager.cancelDownload(gid: gid)
+                    }
+                    .font(.caption).foregroundStyle(.red)
+                }
+                ProgressView(value: progress.fraction)
+                    .tint(.orange)
+            }
+            .padding()
+            .background(CardDesign.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        } else {
+            Button {
+                downloadManager.startNhentaiDownload(gallery: gallery)
+                NotificationCenter.default.post(name: .navigateToDownloadsTab, object: nil)
+            } label: {
+                Label("ダウンロード", systemImage: "arrow.down.circle.fill")
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(.orange.gradient, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .foregroundStyle(.white)
+                    .bold()
+            }
+        }
+    }
+
+    // MARK: - Thumbnail Grid
+
+        private var thumbnailGrid: some View {
+        GroupBox("ページ一覧（\(gallery.num_pages)ページ）") {
+            LazyVGrid(columns: columns, spacing: 4) {
+                // 全ページ一気に表示（LazyVGridが可視範囲のみインスタンス化するので安全）
+                ForEach(0..<gallery.num_pages, id: \.self) { index in
+                    NhThumbCell(gallery: gallery, index: index, coverImage: coverImage) {
+                        HistoryManager.shared.recordNhentai(gallery: gallery, page: index)
+                        readerRequest = NhReaderRequest(page: index)
+                    }
+                }
+            }
+        }
+        .task(id: gallery.images?.pages.count ?? 0) {
+            // detailロード後にgallery.imagesが入る → このtaskが再起動
+            guard let pages = gallery.images?.pages, !pages.isEmpty else { return }
+            let mediaId = gallery.media_id
+            LogManager.shared.log("nhentai", "prefetch triggered: mediaId=\(mediaId) pages=\(pages.count)")
+            // regular Task: view消失時にキャンセル伝播 → 蓄積防止
+            await NhentaiDetailView.prefetchNhThumbsStatic(pages: pages, mediaId: mediaId)
+        }
+    }
+
+    /// E-H SpriteCache.imageQueue準拠: cooperative pool非占有の専用thread
+    static let thumbProcessQueue = DispatchQueue(label: "nh-thumb-process", qos: .userInitiated)
+
+    /// 専用DispatchQueueでpreDecode実行（cooperative pool競合回避）
+    nonisolated static func decodeOnDedicatedQueue(_ data: Data, maxDim: CGFloat) async -> PlatformImage? {
+        await withCheckedContinuation { cont in
+            thumbProcessQueue.async {
+                if let img = PlatformImage(data: data) {
+                    cont.resume(returning: img.preDecoded(maxDim: maxDim))
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// キャンセル伝播を受けない独立prefetch（static = MainActor非隔離）
+    nonisolated private static func prefetchNhThumbsStatic(
+        pages: [NhentaiClient.NhPage], mediaId: String
+    ) async {
+        // 全ページprefetch（スクロール時の個別fetch回避、ただし長すぎる場合は100上限）
+        let maxPrefetch = min(100, pages.count)
+
+        // Phase 0: 即座に全範囲をisLoading=trueにマーク（cellsの個別I/Oを防ぐ）
+        for idx in 0..<maxPrefetch {
+            let cacheKey = NhThumbCell.thumbCacheURL(mediaId: mediaId, page: idx + 1)
+            if ImageCache.shared.memoryImage(for: cacheKey) == nil {
+                ImageCache.shared.setLoading(cacheKey)
+            }
+        }
+
+        // View初期化を阻害しない程度の短い待機
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        var networkNeeded = 0
+        var diskHits = 0
+
+        // Phase 1: ディスクキャッシュから一括ロード（メモリへ格納、isLoading解除）
+        for idx in 0..<maxPrefetch {
+            let cacheKey = NhThumbCell.thumbCacheURL(mediaId: mediaId, page: idx + 1)
+            if ImageCache.shared.memoryImage(for: cacheKey) != nil {
+                ImageCache.shared.removeLoading(cacheKey)
+                continue
+            }
+            if ImageCache.shared.image(for: cacheKey) != nil {
+                // image()内でメモリ格納される。preDecodeは重いので避ける
+                ImageCache.shared.removeLoading(cacheKey)
+                diskHits += 1
+            } else {
+                networkNeeded += 1
+            }
+        }
+        LogManager.shared.log("nhentai", "prefetch phase1: \(diskHits) disk hits, \(networkNeeded) network needed")
+
+        // Phase 2: 3並列DL + 縮小300px + バッチ間300msスリープ
+        let batchSize = 3
+        var idx = 0
+        while idx < maxPrefetch {
+            // view消失時のキャンセル伝播でループ終了（蓄積防止）
+            if Task.isCancelled { break }
+            let batchEnd = min(idx + batchSize, maxPrefetch)
+            await withTaskGroup(of: Void.self) { group in
+                for i in idx..<batchEnd {
+                    let cacheKey = NhThumbCell.thumbCacheURL(mediaId: mediaId, page: i + 1)
+                    if ImageCache.shared.memoryImage(for: cacheKey) != nil {
+                        ImageCache.shared.removeLoading(cacheKey)
+                        continue
+                    }
+                    let page = pages[i]
+                    let pageNum = i + 1
+                    group.addTask {
+                        if Task.isCancelled {
+                            ImageCache.shared.removeLoading(cacheKey)
+                            return
+                        }
+                        if let data = try? await NhentaiClient.fetchThumbImage(
+                            mediaId: mediaId, page: pageNum, ext: page.ext, path: page.thumbPath
+                        ), let decoded = await NhentaiDetailView.decodeOnDedicatedQueue(data, maxDim: 300) {
+                            ImageCache.shared.setThumb(decoded, for: cacheKey)
+                        }
+                        ImageCache.shared.removeLoading(cacheKey)
+                    }
+                }
+            }
+            idx = batchEnd
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        LogManager.shared.log("nhentai", "prefetchNhThumbs: \(maxPrefetch)/\(pages.count) done")
+    }
+
+    // MARK: - Detail Loading
+
+    private func loadFullDetail() async {
+        await detail.load(id: initialGallery.id)
+    }
+
+    // MARK: - Cover Loading
+
+    private func loadCover() async {
+        // 一覧画面で既に取得済みのカバーを ImageCache から流用（ネットワーク不要）
+        let coverURL: URL?
+        if let thumbPath = gallery.thumbnailPath {
+            coverURL = URL(string: "https://t.nhentai.net/\(thumbPath)")
+        } else if let cover = gallery.images?.cover {
+            coverURL = NhentaiClient.coverURL(mediaId: gallery.media_id, ext: cover.ext, path: cover.path)
+        } else {
+            coverURL = nil
+        }
+        if let coverURL, let cached = ImageCache.shared.image(for: coverURL) {
+            coverImage = cached
+            return
+        }
+
+        // キャッシュにない場合のみネットワーク取得
+        guard let cover = gallery.images?.cover else { return }
+        if let data = try? await NhentaiClient.fetchCoverImage(
+            galleryId: gallery.id, mediaId: gallery.media_id, ext: cover.ext, path: cover.path
+        ), let img = PlatformImage(data: data) {
+            coverImage = img
+        }
+    }
+}
+
+/// fullScreenCover(item:) 用
+private struct NhReaderRequest: Identifiable {
+    /// 2026-07-21: UUID だと再代入で identity が変わり cover が閉じ→再生成ループになる
+    var id: Int { page }
+    let page: Int
+}
+
+/// サムネセル（拡張子フォールバック付き取得）
+struct NhThumbCell: View {
+    let gallery: NhentaiClient.NhGallery
+    let index: Int
+    let coverImage: PlatformImage?
+    let onTap: () -> Void
+
+    @State private var thumbImage: PlatformImage?
+    @State private var failed = false
+
+    /// prefetch と共有するキャッシュキー（安定した URL 形式）
+    /// mediaId は API 由来のため異常文字混入で force unwrap クラッシュしないよう
+    /// percent-encoding + 安全フォールバック (View body 経由で呼ばれる)
+    static func thumbCacheURL(mediaId: String, page: Int) -> URL {
+        if let url = URL(string: "nhthumb://\(mediaId)/\(page)") { return url }
+        let encoded = mediaId.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? "invalid"
+        return URL(string: "nhthumb://\(encoded)/\(page)")
+            ?? URL(string: "nhthumb://invalid/\(page)")!
+    }
+
+    /// task(id:) 用の安定キー
+    private var cacheKey: URL {
+        Self.thumbCacheURL(mediaId: gallery.media_id, page: index + 1)
+    }
+
+    var body: some View {
+        // E-H ThumbnailCellView準拠: ButtonではなくonTapGesture
+        ZStack(alignment: .bottomTrailing) {
+            Group {
+                if let img = thumbImage {
+                    Image(platformImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 150, maxHeight: 150)
+                        .clipped()
+                } else if index == 0, let coverImage {
+                    Image(platformImage: coverImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 150, maxHeight: 150)
+                        .clipped()
+                } else if failed {
+                    Color.gray.opacity(0.2)
+                        .frame(height: 150)
+                        .overlay {
+                            Image(systemName: "photo")
+                                .foregroundStyle(.secondary)
+                        }
+                } else {
+                    // UI 刷新 Phase 3 (2026-07-03): ロード中サムネは shimmer (ぐるぐる廃止)
+                    ShimmerPlaceholder(cornerRadius: 4)
+                        .frame(height: 150)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 150, maxHeight: 150)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .contentShape(Rectangle())
+        .onTapGesture { onTap() }
+        .overlay(alignment: .bottomTrailing) {
+            Text("\(index + 1)")
+                .font(.system(size: 10, weight: .bold))
+                .padding(2)
+                .background(.black.opacity(0.6))
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 2))
+                .padding(2)
+        }
+        // E-H準拠: cacheKeyが変わらない限り1回だけ実行
+        .task(id: cacheKey) {
+            await loadThumb()
+        }
+    }
+
+    /// MainActorから完全分離したサムネ取得（E-H ThumbnailCellView準拠）
+    private func loadThumb() async {
+        guard thumbImage == nil, !failed else { return }
+        guard let pages = gallery.images?.pages, index < pages.count else { return }
+
+        // 1. メモリキャッシュ（即座、I/Oなし）
+        if let cached = ImageCache.shared.memoryImage(for: cacheKey) {
+            thumbImage = cached
+            return
+        }
+
+        // 2-4 を全てTask.detachedで実行（MainActorディスクI/O完全排除）
+        let mediaId = gallery.media_id
+        let page = pages[index]
+        let pageNum = index + 1
+        let key = cacheKey
+        let isLoading = ImageCache.shared.isLoading(key)
+
+        let result: PlatformImage? = await Task.detached(priority: .utility) {
+            // 2. ディスクキャッシュ
+            if let cached = ImageCache.shared.image(for: key) {
+                return cached
+            }
+
+            // 3. prefetch進行中なら完了を待つ
+            if isLoading {
+                for _ in 0..<40 {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    if let cached = ImageCache.shared.memoryImage(for: key) {
+                        return cached
+                    }
+                    if !ImageCache.shared.isLoading(key) { break }
+                }
+                if let cached = ImageCache.shared.image(for: key) {
+                    return cached
+                }
+            }
+
+            // 4. ネットワーク取得
+            guard let data = try? await NhentaiClient.fetchThumbImage(
+                mediaId: mediaId, page: pageNum, ext: page.ext, path: page.thumbPath
+            ) else { return nil }
+            if let decoded = await NhentaiDetailView.decodeOnDedicatedQueue(data, maxDim: 300) {
+                ImageCache.shared.setThumb(decoded, for: key)
+                return decoded
+            }
+            return nil
+        }.value
+
+        if let result {
+            thumbImage = result
+        } else {
+            failed = true
+        }
+    }
+}
+
+// MARK: - nhentaiタグ検索
+
+struct NhTagSearch: Hashable {
+    let type: String
+    let name: String
+    var query: String { "\(type):\(name.replacingOccurrences(of: " ", with: "-"))" }
+    var displayTitle: String { "\(type): \(name)" }
+}
+
+struct NhTagSearchResultView: View {
+    let search: NhTagSearch
+    @State private var galleries: [NhentaiClient.NhGallery] = []
+    @State private var isLoading = false
+    @State private var hasMore = true
+    @State private var currentPage = 1
+    @State private var previewGallery: NhentaiClient.NhGallery?
+    @State private var previewReaderRequest: NhentaiPreviewReaderRequest?
+    // タグ飛び先の絞り込み (表示言語)。nh は評価★が無いので言語のみ (E-H TagSearchResultView から移植)。
+    @State private var showFilter = false
+    @State private var selectedLanguages: Set<String> = []
+
+    /// 選択言語を nh 検索構文の language トークンへ変換 (一覧の languageFilter と同方式)。
+    /// 日本語含む or 複数選択 → 選択外を除外、単独選択 → include。
+    private var languageQuery: String? {
+        guard !selectedLanguages.isEmpty else { return nil }
+        if selectedLanguages.contains("japanese") || selectedLanguages.count >= 2 {
+            let defined = Set(AdvancedSearchView.nhentaiLanguages.map { $0.code })
+            let toExclude = defined.subtracting(selectedLanguages)
+            return toExclude.map { "-language:\($0)" }.sorted().joined(separator: " ")
+        }
+        if let only = selectedLanguages.first { return "language:\(only)" }
+        return nil
+    }
+
+    /// タグクエリ + 言語フィルタを合成した実効クエリ。
+    private var effectiveQuery: String {
+        if let lq = languageQuery, !lq.isEmpty { return search.query + " " + lq }
+        return search.query
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(galleries) { nh in
+                    // navPathBox は navigationDestination 先まで伝播せず nil になり
+                    // タップ無反応化する (E-H TagSearchResultView で実測済の同型問題)。
+                    // NavigationLink(value:) で enclosing NavigationStack の path へ直接積む。
+                    // NhGallery の navigationDestination は各タブ root (GalleryListView /
+                    // FavoritesView / HistoryView / DownloadsView) に登録済み。
+                    NavigationLink(value: nh) {
+                        NhentaiCardView(gallery: nh)
+                            .padding(.horizontal)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .highPriorityGesture(
+                        LongPressGesture(minimumDuration: 0.4, maximumDistance: 15)
+                            .onEnded { _ in
+                                #if canImport(UIKit)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                #endif
+                                previewGallery = nh
+                            }
+                    )
+                    Divider().padding(.leading)
+                }
+
+                if hasMore && !galleries.isEmpty {
+                    ProgressView()
+                        .padding()
+                        .task { await loadNext() }
+                }
+
+                if galleries.isEmpty && !isLoading {
+                    ContentUnavailableView {
+                        Label("結果なし", systemImage: "magnifyingglass")
+                    }
+                    .padding(.top, 100)
+                }
+            }
+        }
+        .navigationTitle(search.displayTitle)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showFilter = true
+                } label: {
+                    Image(systemName: selectedLanguages.isEmpty
+                          ? "line.3.horizontal.decrease.circle"
+                          : "line.3.horizontal.decrease.circle.fill")
+                }
+            }
+        }
+        .sheet(isPresented: $showFilter) {
+            NavigationStack {
+                Form {
+                    Section {
+                        ForEach(AdvancedSearchView.nhentaiLanguages, id: \.code) { lang in
+                            Button {
+                                if selectedLanguages.contains(lang.code) { selectedLanguages.remove(lang.code) }
+                                else { selectedLanguages.insert(lang.code) }
+                            } label: {
+                                HStack {
+                                    Text(lang.label).foregroundStyle(.primary)
+                                    Spacer()
+                                    if selectedLanguages.contains(lang.code) {
+                                        Image(systemName: "checkmark").foregroundStyle(.blue)
+                                    }
+                                }
+                                .contentShape(Rectangle())   // 行全体を当たり判定に
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        if !selectedLanguages.isEmpty {
+                            Button("クリア") { selectedLanguages.removeAll() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    } header: {
+                        Text("表示する言語")
+                    } footer: {
+                        Text("選択した言語のみ表示（未選択なら全言語）。")
+                    }
+                }
+                .navigationTitle("絞り込み")
+                #if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
+                #endif
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("適用") {
+                            showFilter = false
+                            galleries = []
+                            Task { await loadFirst() }
+                        }
+                    }
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("閉じる") { showFilter = false }
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
+        .overlay {
+            if isLoading && galleries.isEmpty {
+                ProgressView("検索中...")
+            }
+            if let nh = previewGallery {
+                NhentaiPreviewOverlay(
+                    gallery: nh,
+                    onDismiss: { previewGallery = nil },
+                    onTapPage: { loadedGallery, page in
+                        previewReaderRequest = NhentaiPreviewReaderRequest(gallery: loadedGallery, page: page)
+                    }
+                )
+            }
+        }
+        #if os(iOS)
+        .fullScreenCover(item: $previewReaderRequest) { req in
+            NhentaiReaderView(gallery: req.gallery, initialPage: req.page, route: .nhDetailPreview)
+                .onAppear {
+                    HistoryManager.shared.recordNhentai(gallery: req.gallery, page: req.page)
+                    previewGallery = nil
+                }
+        }
+        #endif
+        .task {
+            guard galleries.isEmpty else { return }
+            await loadFirst()
+        }
+    }
+
+    private func loadFirst() async {
+        isLoading = true
+        currentPage = 1
+        do {
+            let result = try await NhentaiClient.search(query: effectiveQuery, page: 1)
+            galleries = result.result
+            hasMore = result.num_pages > 1
+        } catch {
+            LogManager.shared.log("nhentai", "tag search failed: \(error.localizedDescription)")
+        }
+        isLoading = false
+    }
+
+    private func loadNext() async {
+        guard !isLoading, hasMore else { return }
+        isLoading = true
+        currentPage += 1
+        do {
+            let result = try await NhentaiClient.search(query: effectiveQuery, page: currentPage)
+            // 田中報告 2026-04-27 同型: append 時に同 id 重複除外 (LazyVGrid 空白行対策、B3 共通)
+            galleries.appendDeduplicated(result.result)
+            hasMore = currentPage < result.num_pages
+        } catch {
+            LogManager.shared.log("nhentai", "tag search next failed: \(error.localizedDescription)")
+        }
+        isLoading = false
+    }
+}
+

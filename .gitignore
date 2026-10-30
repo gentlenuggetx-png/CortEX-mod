@@ -1,0 +1,53 @@
+# Xcode
+DerivedData/
+*.xcuserdata/
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+build/
+.build/
+
+# CocoaPods
+Pods/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Backup copies
+*~
+*.swp
+
+# Claude Code temp
+.claude/
+
+# App data (never commit)
+*.cortex
+favorites_cache.json
+nh_favorites_cache.json
+
+# Development tools (not part of app)
+hent-AI-master/
+scripts/
+*.pth
+weights.h5
+CortEX/
+
+# Secrets / credentials (never commit — 憲法第18条)
+Secrets.plist
+.env
+*.pem
+*.key
+*.p8
+*.p12
+credentials.json
+
+# ローカル LLM (aider / OpenCode 等) のスクラッチ — 誤コミット防止 (第18条保険)
+.aider*
+.opencode/
+.ornith/
