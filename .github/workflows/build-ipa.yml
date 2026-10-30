@@ -9,7 +9,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macos-26 has Xcode 26.5; Xcode 26.3 (macos-15) times out type-checking the big SwiftUI bodies
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
