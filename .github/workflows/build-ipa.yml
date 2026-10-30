@@ -37,3 +37,35 @@ jobs:
         with:
           name: CortEX-mod-ipa
           path: CortEX-mod.ipa
+
+  # (mod) シミュレーター版: Mac の Xcode Simulator にドラッグ、または appetize.io に
+  # アップロードしてブラウザで動作確認できる (IPA を作る前のテスト用)
+  simulator:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build (simulator)
+        run: |
+          xcodebuild -project EhViewer.xcodeproj -scheme EhViewer \
+            -configuration Release -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Zip app
+        run: |
+          cd build/Build/Products/Release-iphonesimulator
+          zip -qry "$GITHUB_WORKSPACE/CortEX-mod-simulator.zip" EhViewer.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CortEX-mod-simulator
+          path: CortEX-mod-simulator.zip

@@ -162,6 +162,9 @@ struct NhentaiScrollList: View {
                 ForEach(viewModel.galleries) { nh in
                     // UI 刷新 (2026-07-03): 行をカード化 (E-H 側と同型)
                     CardDesign.cardChrome(NhentaiCardView(gallery: nh))
+                        .overlay(alignment: .bottomTrailing) {
+                            NhFavoriteHeartButton(gallery: nh).padding(8)
+                        }
                         .matchedTransitionSource(id: "nh-\(nh.id)", in: zoomNamespace)   // B3 online
                         .padding(.horizontal)
                         .padding(.vertical, 4)
@@ -528,6 +531,48 @@ struct NhentaiCoverView: View {
                 ImageCache.shared.setThumb(img, for: capturedURL)
                 coverImage = img
             }
+        }
+    }
+}
+
+/// (mod) フィード用のお気に入りハート。タップで追加/解除 (未ログインならアプリ内のみ)
+struct NhFavoriteHeartButton: View {
+    let gallery: NhentaiClient.NhGallery
+    @ObservedObject private var nhFavCache = NhentaiFavoritesCache.shared
+
+    var body: some View {
+        // version を読んで変更時に再描画させる
+        let _ = nhFavCache.version
+        let isFavorited = nhFavCache.contains(id: gallery.id)
+        Button {
+            toggle(isFavorited: isFavorited)
+        } label: {
+            Image(systemName: isFavorited ? "heart.fill" : "heart")
+                .font(.title3)
+                .foregroundStyle(isFavorited ? .red : .secondary)
+                .padding(10)
+                .modGlass(in: Circle())
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private func toggle(isFavorited: Bool) {
+        #if canImport(UIKit)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
+        let gid = gallery.id
+        let loggedIn = NhentaiCookieManager.isLoggedIn()
+        if isFavorited {
+            nhFavCache.removeFromCache(id: gid)
+            #if canImport(UIKit)
+            if loggedIn, let url = URL(string: "https://nhentai.net/g/\(gid)/") {
+                UIApplication.shared.open(url)
+            }
+            #endif
+        } else {
+            nhFavCache.addToCache(gallery)
+            guard loggedIn else { return }
+            Task { _ = try? await NhentaiClient.toggleFavorite(galleryId: gid) }
         }
     }
 }

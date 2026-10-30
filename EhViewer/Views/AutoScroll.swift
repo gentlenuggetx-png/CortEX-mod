@@ -163,9 +163,8 @@ struct AutoScrollButton: View {
         .foregroundStyle(.white)
         .padding(.horizontal, expanded ? 16 : 10)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial.opacity(expanded ? 0.9 : 0.5))
-        .clipShape(Capsule())
-        .opacity(expanded || controller.isRunning ? 1 : 0.6)
+        .modGlass(in: Capsule())
+        .opacity(expanded || controller.isRunning ? 1 : 0.8)
         .padding(.trailing, 16)
         .padding(.bottom, expanded ? 120 : 28)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
@@ -201,12 +200,24 @@ struct ReaderBackButton: View {
                 .font(.headline.bold())
                 .foregroundStyle(.white)
                 .frame(width: 36, height: 36)
-                .background(.black.opacity(0.45), in: Circle())
+                .modGlass(in: Circle())
         }
         .buttonStyle(.plain)
         .padding(.leading, 12)
         .padding(.top, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .transition(.opacity)
+    }
+}
+
+extension View {
+    /// (mod) iOS 26+ は Liquid Glass (ナビの戻るボタンと同じ質感)、旧 OS はすりガラス
+    @ViewBuilder
+    func modGlass<S: Shape>(in shape: S) -> some View {
+        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
+            self.glassEffect(.regular.interactive(), in: shape)
+        } else {
+            self.background(.ultraThinMaterial, in: shape)
+        }
     }
 }

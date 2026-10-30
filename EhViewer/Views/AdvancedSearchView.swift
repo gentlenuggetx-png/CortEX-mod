@@ -296,6 +296,27 @@ struct AdvancedSearchView: View {
                 .disabled(tagInput.trimmingCharacters(in: .whitespaces).isEmpty)
             }
 
+            // (mod) タグ候補: 入力中の文字に一致するタグをタップで追加
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(tagSuggestions, id: \.self) { tag in
+                        Button {
+                            addSuggestedTag(tag)
+                        } label: {
+                            Text(tag)
+                                .font(.caption)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    (tagInputExcludes ? Color.red : Color.accentColor).opacity(0.15),
+                                    in: Capsule()
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
             if !includeTags.isEmpty || !excludeTags.isEmpty {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 110), spacing: 8)],
@@ -324,6 +345,19 @@ struct AdvancedSearchView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var tagSuggestions: [String] {
+        TagSuggestions.matches(for: tagInput, excluding: Set(includeTags + excludeTags))
+    }
+
+    /// 候補タップ: 入力中の最後の語を候補で置き換えて追加
+    private func addSuggestedTag(_ tag: String) {
+        var parts = tagInput.split(separator: ",").map(String.init)
+        if !parts.isEmpty { parts.removeLast() }
+        parts.append(tag)
+        tagInput = parts.joined(separator: ",")
+        commitTagInput()
     }
 
     /// 入力欄の内容をチップに追加 (カンマ区切りで複数同時追加可)

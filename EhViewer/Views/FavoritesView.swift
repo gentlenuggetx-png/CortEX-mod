@@ -409,7 +409,7 @@ struct FavoritesView: View {
                                         .font(.title3)
                                         .foregroundStyle(.red)
                                         .padding(10)
-                                        .background(.ultraThinMaterial, in: Circle())
+                                        .modGlass(in: Circle())
                                 }
                                 .buttonStyle(.borderless)
                                 .padding(8)

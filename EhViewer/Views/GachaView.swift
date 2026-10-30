@@ -80,6 +80,8 @@ struct GachaView: View {
     // 他経路 (DownloadsView/FavoritesView/GalleryListView) は path bind + navPathBox 注入で
     // 既に修正済 (commit 91760d5 他)。ガチャだけ漏れていたので同パターンを適用。
     @StateObject private var navPathBox = NavigationPathBox()
+    // (mod) nhentai お気に入りからも引けるように
+    @AppStorage("gachaSource.nhentai") private var useNhentai = true
 
     private enum GachaPhase {
         case idle, filling, darkening, result
@@ -98,6 +100,19 @@ struct GachaView: View {
 
                     // メインUI
                     VStack(spacing: 0) {
+                        if !showFullscreen {
+                            Picker("Source", selection: $useNhentai) {
+                                Text("E-Hentai").tag(false)
+                                Text("nhentai").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            .padding(.horizontal)
+                            .padding(.top, 6)
+                        }
+
+                        if useNhentai && !showFullscreen {
+                            NhentaiRandomPicker()
+                        } else {
                         Spacer()
 
                         if allFavorites.isEmpty {
@@ -107,6 +122,7 @@ struct GachaView: View {
                         }
 
                         Spacer()
+                        }
                     }
                     .opacity(uiOpacity)
 
@@ -165,7 +181,7 @@ struct GachaView: View {
                         .padding(.top, 60)
                 }
             }
-            .navigationTitle(showFullscreen ? "" : "ガチャ")
+            .navigationTitle(showFullscreen ? "" : "Random Book")
             #if os(iOS)
             .navigationBarHidden(showFullscreen)
             .statusBarHidden(showFullscreen)
@@ -175,6 +191,9 @@ struct GachaView: View {
             .onDisappear { displayLink.stop() }
             .navigationDestination(for: Gallery.self) { gallery in
                 GalleryDetailView(gallery: gallery, host: .exhentai)
+            }
+            .navigationDestination(for: NhentaiClient.NhGallery.self) { nh in
+                NhentaiDetailView(gallery: nh)
             }
         }
         .environment(\.navPathBox, navPathBox)

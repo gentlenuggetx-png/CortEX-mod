@@ -312,7 +312,7 @@ struct ContentView: View {
                 .tabItem { Label("お気に入り", systemImage: "heart.fill") }
                 .tag(1)
             GachaView()
-                .tabItem { Label("ガチャ", systemImage: "dice.fill") }
+                .tabItem { Label("Random", systemImage: "dice.fill") }
                 .tag(2)
             DownloadsView()
                 .tabItem { Label("ライブラリ", systemImage: "books.vertical.fill") }
@@ -753,7 +753,7 @@ struct CatalystTabBar: View {
     private let tabs: [(tag: Int, title: String, icon: String)] = [
         (0, "ギャラリー", "photo.on.rectangle.angled"),
         (1, "お気に入り", "heart.fill"),
-        (2, "ガチャ", "dice.fill"),
+        (2, "Random", "dice.fill"),
         (3, "ライブラリ", "books.vertical.fill"),
         (4, "履歴", "clock.arrow.circlepath"),
         (5, "お気に入りキャラクター管理", "person.2.fill"),
